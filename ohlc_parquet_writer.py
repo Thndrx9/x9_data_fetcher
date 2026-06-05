@@ -10,8 +10,8 @@ import pandas as pd
 
 class OhlcParquetWriter:
     """
-    Buffered single-writer for OHLC tick rows.
-    Writes to: <base_dir>/<SYMBOL>/ohlc.parquet
+    Buffered single-writer for quote tick rows used for later candle generation.
+    Writes to: <base_dir>/<SYMBOL>/quote.parquet
     """
 
     def __init__(self, base_dir: str, flush_batch_size: int = 200, flush_interval_sec: float = 1.0):
@@ -41,7 +41,7 @@ class OhlcParquetWriter:
         if not rows:
             return
 
-        path = self.base_dir / symbol / "ohlc.parquet"
+        path = self.base_dir / symbol / "quote.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         df_new = pd.DataFrame(rows)
         if df_new.empty:
