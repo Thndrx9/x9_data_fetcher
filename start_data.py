@@ -2,6 +2,7 @@ import asyncio
 import os
 import signal
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,8 +16,29 @@ from x9_data_fetcher.venv_setup import create_and_activate_venv
 create_and_activate_venv()
 
 from x9_data_fetcher.data_fetcher import MarketDataFetcher
+from x9_data_fetcher.event_bus import market_data_queue
+from x9_data_fetcher.market_time import (
+    is_connectable,
+    now_kolkata,
+    seconds_until_close,
+    seconds_until_pre_connect,
+)
 from x9_data_fetcher.symbols import load_symbols
 from x9_data_fetcher.websocket_connect import websocket_client
+
+
+def _drain_queue():
+    """Drain leftover items from the shared async queue between sessions."""
+    dropped = 0
+    while not market_data_queue.empty():
+        try:
+            market_data_queue.get_nowait()
+            market_data_queue.task_done()
+            dropped += 1
+        except asyncio.QueueEmpty:
+            break
+    if dropped:
+        print(f"[X9_FETCHER] Drained {dropped} stale packets from queue", flush=True)
 
 
 async def run_engine():
@@ -35,7 +57,9 @@ async def run_engine():
 
     symbols_csv = os.getenv("X9_FETCHER_SYMBOLS_CSV", "x9/symbols.csv")
     depth_output_dir = os.getenv("X9_DEPTH_OUTPUT_DIR", "data")
-    ohlc_output_dir = os.getenv("X9_OHLC_OUTPUT_DIR", "data")
+    quote_output_dir = os.getenv(
+        "X9_QUOTE_OUTPUT_DIR", os.getenv("X9_OHLC_OUTPUT_DIR", "data")
+    )
     depth_levels = int(os.getenv("X9_DEPTH_LEVELS", "5"))
     flush_batch = int(os.getenv("X9_DEPTH_FLUSH_BATCH", "200"))
     flush_interval = float(os.getenv("X9_DEPTH_FLUSH_INTERVAL_SEC", "1.0"))
@@ -45,40 +69,110 @@ async def run_engine():
         raise RuntimeError(f"No symbols found in {symbols_csv}")
 
     instruments = [{"exchange": s["exchange"], "symbol": s["symbol"]} for s in symbols]
-    fetcher = MarketDataFetcher(
-        depth_output_dir=depth_output_dir,
-        ohlc_output_dir=ohlc_output_dir,
-        depth_levels=depth_levels,
-        flush_batch_size=flush_batch,
-        flush_interval_sec=flush_interval,
-    )
 
-    stop_event = asyncio.Event()
-
-    def _request_stop():
-        stop_event.set()
-
+    # ── Graceful exit on SIGINT / SIGTERM ──
+    manual_stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, _request_stop)
-    loop.add_signal_handler(signal.SIGTERM, _request_stop)
-
-    tasks = [
-        asyncio.create_task(websocket_client(ws_url, api_key, instruments, depth_levels)),
-        asyncio.create_task(fetcher.run()),
-    ]
+    loop.add_signal_handler(signal.SIGINT, manual_stop.set)
+    loop.add_signal_handler(signal.SIGTERM, manual_stop.set)
 
     print(
-        f"[X9_FETCHER] Started | symbols={len(instruments)} | ws={ws_url} | depth={depth_levels}",
+        f"[X9_FETCHER] Initialized | symbols={len(instruments)} | ws={ws_url}",
         flush=True,
     )
 
-    await stop_event.wait()
+    # ── Daily loop ──────────────────────────────────────────────────────
+    while not manual_stop.is_set():
+        now = now_kolkata()
 
-    for t in tasks:
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    fetcher.shutdown()
-    print("[X9_FETCHER] Shutdown complete", flush=True)
+        # ── Wait for pre-connect window (9:14 IST) if market is closed ──
+        if not is_connectable(now):
+            wait_secs = seconds_until_pre_connect(now)
+            resume_at = now + timedelta(seconds=wait_secs)
+            print(
+                f"[X9_FETCHER] Market closed. Next session: "
+                f"{resume_at.strftime('%Y-%m-%d %H:%M:%S')} IST "
+                f"(waiting {wait_secs / 3600:.1f}h)",
+                flush=True,
+            )
+            try:
+                await asyncio.wait_for(manual_stop.wait(), timeout=wait_secs)
+            except asyncio.TimeoutError:
+                pass  # Timer expired → time to connect
+            continue  # Re-evaluate after waking
+
+        # ── Start trading session ───────────────────────────────────────
+        close_secs = seconds_until_close(now)
+        if close_secs <= 0:
+            continue  # Edge case: woke up exactly at 15:30
+
+        _drain_queue()
+
+        fetcher = MarketDataFetcher(
+            depth_output_dir=depth_output_dir,
+            quote_output_dir=quote_output_dir,
+            flush_batch_size=flush_batch,
+            flush_interval_sec=flush_interval,
+        )
+
+        # Auto-close event fires at market close (15:30)
+        session_stop = asyncio.Event()
+
+        async def _auto_close(secs: float):
+            try:
+                await asyncio.sleep(secs)
+            except asyncio.CancelledError:
+                return
+            session_stop.set()
+
+        close_task = asyncio.create_task(_auto_close(close_secs))
+
+        tasks = [
+            asyncio.create_task(
+                websocket_client(ws_url, api_key, instruments, mode="Quote")
+            ),
+            asyncio.create_task(
+                websocket_client(
+                    ws_url, api_key, instruments, mode="Depth", depth_levels=depth_levels
+                )
+            ),
+            asyncio.create_task(fetcher.run()),
+        ]
+
+        print(
+            f"[X9_FETCHER] Session started at "
+            f"{now.strftime('%H:%M:%S')} IST | "
+            f"auto-close in {close_secs / 60:.0f} min",
+            flush=True,
+        )
+
+        # ── Block until market close OR manual stop ─────────────────────
+        wait_tasks = [
+            asyncio.create_task(session_stop.wait()),
+            asyncio.create_task(manual_stop.wait()),
+        ]
+        _done, pending = await asyncio.wait(
+            wait_tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+
+        # ── Tear down session ───────────────────────────────────────────
+        close_task.cancel()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, close_task, return_exceptions=True)
+        fetcher.shutdown()
+
+        if manual_stop.is_set():
+            print("[X9_FETCHER] Manual shutdown complete", flush=True)
+            break
+
+        print(
+            "[X9_FETCHER] Market closed at 15:30. Session ended, data flushed.",
+            flush=True,
+        )
+        # Loop back → will calculate wait until next 9:14 (skipping weekends)
 
 
 if __name__ == "__main__":
