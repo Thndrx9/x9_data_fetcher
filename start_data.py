@@ -60,6 +60,7 @@ async def run_engine():
     quote_output_dir = os.getenv(
         "X9_QUOTE_OUTPUT_DIR", os.getenv("X9_OHLC_OUTPUT_DIR", "data")
     )
+    pg_dsn = os.getenv("X9_PG_DSN", os.getenv("X9_POSTGRES_DSN", "")).strip() or None
     depth_levels = int(os.getenv("X9_DEPTH_LEVELS", "5"))
     flush_batch = int(os.getenv("X9_DEPTH_FLUSH_BATCH", "200"))
     flush_interval = float(os.getenv("X9_DEPTH_FLUSH_INTERVAL_SEC", "1.0"))
@@ -111,6 +112,7 @@ async def run_engine():
         fetcher = MarketDataFetcher(
             depth_output_dir=depth_output_dir,
             quote_output_dir=quote_output_dir,
+            pg_dsn=pg_dsn,
             flush_batch_size=flush_batch,
             flush_interval_sec=flush_interval,
         )

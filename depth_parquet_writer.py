@@ -109,7 +109,7 @@ def _ensure_table(conn: sqlite3.Connection, sym: str, known_tables: Set[str]) ->
 
 @lru_cache(maxsize=256)
 def _insert_sql(table: str) -> str:
-    """Cache INSERT SQL per table — 40 columns, built once per symbol."""
+    """Cache INSERT SQL per table — 3 columns (timestamp, ingest_ns, raw_json), built once per symbol."""
     placeholders = ",".join(["?"] * 3)
     return f"INSERT INTO {table} VALUES ({placeholders})"
 

@@ -8,6 +8,11 @@ from x9_data_fetcher.event_bus import market_data_queue
 from x9_data_fetcher.market_time import tz_kolkata
 from x9_data_fetcher.ohlc_parquet_writer import OhlcParquetWriter
 
+try:
+    from x9_data_fetcher.pg_writer import PgWriter
+except ImportError:  # pragma: no cover - optional dependency
+    PgWriter = None
+
 
 def _to_iso_ts(value: Any) -> str:
     if value is None:
@@ -46,7 +51,7 @@ def _extract_depth_row(message: Dict[str, Any]) -> Dict[str, Any] | None:
 
     return {
         "timestamp": _to_iso_ts(inner.get("timestamp")),
-        "ingest_ts_ns": time.time_ns(),
+        "ingest_ns": time.time_ns(),
         "exchange": str(exchange).upper(),
         "symbol": str(symbol).upper(),
         "raw_json": json.dumps(inner, ensure_ascii=True),
@@ -66,7 +71,7 @@ def _extract_quote_row(message: Dict[str, Any]) -> Dict[str, Any] | None:
 
     return {
         "timestamp": _to_iso_ts(inner.get("ltt") or inner.get("timestamp")),
-        "ingest_ts_ns": time.time_ns(),
+        "ingest_ns": time.time_ns(),
         "exchange": str(exchange).upper(),
         "symbol": str(symbol).upper(),
         "raw_json": json.dumps(inner, ensure_ascii=True),
@@ -76,13 +81,15 @@ def _extract_quote_row(message: Dict[str, Any]) -> Dict[str, Any] | None:
 class MarketDataFetcher:
     """
     Data fetch/transform only:
-    consumes websocket packets from event_bus queue and writes parquet.
+    consumes websocket packets from event_bus queue and writes SQLite,
+    with an optional PostgreSQL mirror.
     """
 
     def __init__(
         self,
         depth_output_dir: str,
         quote_output_dir: str,
+        pg_dsn: str | None = None,
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
     ):
@@ -96,6 +103,26 @@ class MarketDataFetcher:
             flush_batch_size=flush_batch_size,
             flush_interval_sec=flush_interval_sec,
         )
+        self.depth_pg_writer = None
+        self.quote_pg_writer = None
+
+        if pg_dsn:
+            if PgWriter is None:
+                raise RuntimeError(
+                    "PG writer requested but psycopg2 is not available"
+                )
+            self.depth_pg_writer = PgWriter(
+                table="depth",
+                dsn=pg_dsn,
+                flush_batch_size=flush_batch_size,
+                flush_interval_sec=flush_interval_sec,
+            )
+            self.quote_pg_writer = PgWriter(
+                table="quote",
+                dsn=pg_dsn,
+                flush_batch_size=flush_batch_size,
+                flush_interval_sec=flush_interval_sec,
+            )
 
     async def run(self):
         while True:
@@ -105,14 +132,24 @@ class MarketDataFetcher:
                 if mode == "depth":
                     depth_row = _extract_depth_row(packet)
                     if depth_row:
-                        self.depth_writer.enqueue(depth_row["symbol"], depth_row)
+                        symbol = depth_row["symbol"]
+                        self.depth_writer.enqueue(symbol, depth_row)
+                        if self.depth_pg_writer:
+                            self.depth_pg_writer.enqueue(symbol, depth_row)
                 elif mode == "quote":
                     quote_row = _extract_quote_row(packet)
                     if quote_row:
-                        self.ohlc_writer.enqueue(quote_row["symbol"], quote_row)
+                        symbol = quote_row["symbol"]
+                        self.ohlc_writer.enqueue(symbol, quote_row)
+                        if self.quote_pg_writer:
+                            self.quote_pg_writer.enqueue(symbol, quote_row)
             finally:
                 market_data_queue.task_done()
 
     def shutdown(self):
         self.ohlc_writer.shutdown()
         self.depth_writer.shutdown()
+        if self.quote_pg_writer:
+            self.quote_pg_writer.shutdown()
+        if self.depth_pg_writer:
+            self.depth_pg_writer.shutdown()
