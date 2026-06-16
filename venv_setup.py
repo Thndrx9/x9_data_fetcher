@@ -12,6 +12,7 @@ REQUIRED_PACKAGES = [
     "pandas",
     "pyarrow",
     "websockets",
+    "psycopg2-binary",
 ]
 
 REQUIREMENTS_FILE = Path("x9_data_fetcher/requirements.txt")

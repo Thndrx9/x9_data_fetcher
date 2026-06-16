@@ -2,3 +2,4 @@ python-dotenv
 pandas
 pyarrow
 websockets
+psycopg2-binary
