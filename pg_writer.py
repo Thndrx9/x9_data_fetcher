@@ -1,43 +1,100 @@
 """
-PostgreSQL live mirror with auto-setup.
+PostgreSQL live mirror — runs on AWS alongside the SQLite writers.
 
-On first run (localhost only):
-  - installs PostgreSQL if missing
-  - starts the service
-  - detects version automatically
-  - configures listen_addresses and pg_hba.conf
-  - creates user and database from .env credentials
-  - verifies connection
+Architecture
+------------
+    Tick arrives
+        ├── DepthParquetWriter  → SQLite depth_SYMBOL tables  (primary)
+        ├── OhlcParquetWriter   → SQLite quote_SYMBOL tables  (primary)
+        ├── PgWriter('depth')   → PostgreSQL depth table      (live mirror)
+        └── PgWriter('quote')   → PostgreSQL quote table      (live mirror)
 
-After first successful setup, all setup steps are skipped on restart.
+Schema matches SQLite writers:
+    timestamp INTEGER  → BIGINT  (exchange ms from raw_json)
+    ingest_ns INTEGER  → BIGINT  (AWS box nanoseconds)
+    raw_json  TEXT     → JSONB   (full tick — queryable in PG)
 
-.env keys read by this module
-------------------------------
-    PG_HOST      = localhost          # use localhost — DSN built automatically
-    PG_PORT      = 5432
-    PG_USER      = collector
-    PG_PASSWORD  = yourpassword
-    PG_DBNAME    = market
+PG adds one extra column SQLite doesn't need:
+    symbol TEXT  (SQLite encodes symbol in the table name, PG uses one table)
 
-Table layout (matches SQLite writers exactly)
----------------------------------------------
-    depth_RELIANCE, depth_TCS ...    one table per symbol
-    quote_RELIANCE, quote_TCS ...    one table per symbol
+AWS Setup (run once)
+--------------------
+    sudo apt install postgresql postgresql-contrib -y
 
-    Each table: timestamp BIGINT | ingest_ns BIGINT | raw_json JSONB
+    sudo -u postgres psql << SQL
+        CREATE USER collector WITH PASSWORD 'yourpassword';
+        CREATE DATABASE market OWNER collector;
+    SQL
+
+    # tune postgresql.conf for low RAM (mirror only, not primary)
+    # shared_buffers   = 64MB
+    # work_mem         = 2MB
+    # max_connections  = 5
+    # wal_level        = minimal
+    sudo systemctl restart postgresql
+
+    # open port 5432 in AWS security group for your local IP only
+
+Install dependency
+------------------
+    pip install psycopg2-binary
+
+Wire into your fetcher
+----------------------
+    DSN = "host=<aws-ip> dbname=market user=collector password=yourpassword port=5432"
+
+    depth_sqlite = DepthParquetWriter(base_dir)
+    quote_sqlite = OhlcParquetWriter(base_dir)
+    depth_pg     = PgWriter(table='depth', dsn=DSN)
+    quote_pg     = PgWriter(table='quote', dsn=DSN)
+
+    # on every depth tick
+    depth_sqlite.enqueue(symbol, row)
+    depth_pg.enqueue(symbol, row)
+
+    # on every quote tick
+    quote_sqlite.enqueue(symbol, row)
+    quote_pg.enqueue(symbol, row)
+
+    # on shutdown
+    depth_sqlite.shutdown()
+    quote_sqlite.shutdown()
+    depth_pg.shutdown()
+    quote_pg.shutdown()
+
+Query from local PC
+-------------------
+    import psycopg2
+    conn = psycopg2.connect("host=<aws-ip> dbname=market user=collector password=...")
+    cur  = conn.cursor()
+
+    # live last 100 ticks for a symbol
+    cur.execute(
+        "SELECT timestamp, raw_json FROM depth "
+        "WHERE symbol=%s ORDER BY timestamp DESC LIMIT 100",
+        ('RELIANCE',)
+    )
+
+    # fetch missed gap after internet dropout
+    cur.execute(
+        "SELECT timestamp, ingest_ns, symbol, raw_json FROM depth "
+        "WHERE symbol=%s AND timestamp BETWEEN %s AND %s ORDER BY timestamp",
+        ('RELIANCE', dropout_start_ms, reconnect_ms)
+    )
+
+    # query fields inside raw_json directly (JSONB advantage)
+    cur.execute(
+        "SELECT timestamp, raw_json->>'ltp' AS ltp FROM quote "
+        "WHERE symbol=%s ORDER BY timestamp DESC LIMIT 100",
+        ('RELIANCE',)
+    )
 """
 
 import json
-import os
 import queue
-import re
-import shutil
-import subprocess
 import threading
 import time
-from functools import lru_cache
-from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -48,312 +105,51 @@ import psycopg2.extensions
 IST = ZoneInfo("Asia/Kolkata")
 
 # ---------------------------------------------------------------------------
-# Credentials — read from environment (loaded by dotenv before this runs)
+# Schema
+# ---------------------------------------------------------------------------
+# Single table per data type — symbol is a column not a table name.
+# Matches SQLite column structure exactly:
+#   timestamp INTEGER  →  BIGINT  (exchange ms)
+#   ingest_ns INTEGER  →  BIGINT  (AWS box nanoseconds)
+#   raw_json  TEXT     →  JSONB   (binary JSON — queryable by field)
+#
+# PG adds symbol TEXT since it uses one shared table unlike SQLite's
+# per-symbol table approach.
 # ---------------------------------------------------------------------------
 
-def _dsn_from_env() -> str:
-    host     = os.getenv("PG_HOST",     "localhost")
-    port     = os.getenv("PG_PORT",     "5432")
-    user     = os.getenv("PG_USER",     "collector")
-    password = os.getenv("PG_PASSWORD", "")
-    dbname   = os.getenv("PG_DBNAME",   "market")
-    return f"host={host} port={port} dbname={dbname} user={user} password={password}"
+_CREATE_SQL = """
+    CREATE TABLE IF NOT EXISTS depth (
+        timestamp  BIGINT NOT NULL,
+        ingest_ns  BIGINT,
+        symbol     TEXT   NOT NULL,
+        raw_json   JSONB  NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_depth ON depth (symbol, timestamp);
 
+    CREATE TABLE IF NOT EXISTS quote (
+        timestamp  BIGINT NOT NULL,
+        ingest_ns  BIGINT,
+        symbol     TEXT   NOT NULL,
+        raw_json   JSONB  NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_quote ON quote (symbol, timestamp);
+"""
 
-def _superuser_dsn() -> str:
-    """DSN for postgres superuser — used only during setup."""
-    host = os.getenv("PG_HOST", "localhost")
-    port = os.getenv("PG_PORT", "5432")
-    return f"host={host} port={port} dbname=postgres user=postgres"
-
-
-# ---------------------------------------------------------------------------
-# Auto setup — runs only on localhost, only when needed
-# ---------------------------------------------------------------------------
-
-def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, shell=True, capture_output=True, text=True, check=check
-    )
-
-
-def _is_pg_installed() -> bool:
-    return shutil.which("pg_lsclusters") is not None
-
-
-def _install_pg() -> None:
-    print("[PG_SETUP] PostgreSQL not found — installing...", flush=True)
-    _run("sudo apt-get update -qq")
-    _run("sudo apt-get install -y postgresql postgresql-contrib")
-    print("[PG_SETUP] PostgreSQL installed", flush=True)
-
-
-def _detect_pg_version() -> Optional[str]:
-    """Detect installed PG version from pg_lsclusters output."""
-    result = _run("pg_lsclusters", check=False)
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if parts and parts[0].isdigit():
-            return parts[0]   # e.g. '18'
-    return None
-
-
-def _ensure_service_running(version: str) -> None:
-    result = _run(f"sudo systemctl is-active postgresql@{version}-main", check=False)
-    if result.stdout.strip() != "active":
-        print(f"[PG_SETUP] Starting PostgreSQL {version}...", flush=True)
-        _run(f"sudo systemctl start postgresql@{version}-main")
-        time.sleep(2)
-        print("[PG_SETUP] Service started", flush=True)
-
-
-def _configure_pg(version: str) -> None:
-    """
-    Set listen_addresses = * and tune for low RAM.
-    Only writes lines that are not already correctly set.
-    """
-    conf_path = Path(f"/etc/postgresql/{version}/main/postgresql.conf")
-    hba_path  = Path(f"/etc/postgresql/{version}/main/pg_hba.conf")
-
-    # --- postgresql.conf ---
-    conf_text = conf_path.read_text()
-    changes   = False
-
-    settings = {
-        "listen_addresses": "'*'",
-        "shared_buffers":   "64MB",
-        "work_mem":         "2MB",
-        "max_connections":  "10",
-        "wal_level":        "minimal",
-    }
-
-    for key, val in settings.items():
-        # match commented or uncommented line for this key
-        pattern = rf"^#?\s*{key}\s*=.*$"
-        new_line = f"{key} = {val}"
-        if re.search(pattern, conf_text, re.MULTILINE):
-            conf_text, n = re.subn(pattern, new_line, conf_text, flags=re.MULTILINE)
-            if n:
-                changes = True
-        else:
-            conf_text += f"\n{new_line}\n"
-            changes = True
-
-    if changes:
-        conf_path.write_text(conf_text)
-        print("[PG_SETUP] postgresql.conf updated", flush=True)
-
-    # --- pg_hba.conf ---
-    user   = os.getenv("PG_USER",   "collector")
-    dbname = os.getenv("PG_DBNAME", "market")
-    hba_line = f"host    {dbname}    {user}    0.0.0.0/0    scram-sha-256\n"
-
-    hba_text = hba_path.read_text()
-    if hba_line.strip() not in hba_text:
-        hba_path.write_text(hba_text + "\n" + hba_line)
-        print("[PG_SETUP] pg_hba.conf updated", flush=True)
-
-
-def _create_user_and_db() -> None:
-    """Create PG user and database using superuser connection."""
-    user     = os.getenv("PG_USER",     "collector")
-    password = os.getenv("PG_PASSWORD", "")
-    dbname   = os.getenv("PG_DBNAME",  "market")
-
-    conn = psycopg2.connect(_superuser_dsn())
-    conn.autocommit = True
-    cur  = conn.cursor()
-
-    # create user if not exists
-    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (user,))
-    if not cur.fetchone():
-        cur.execute(
-            f"CREATE USER {user} WITH PASSWORD %s", (password,)
-        )
-        print(f"[PG_SETUP] user '{user}' created", flush=True)
-    else:
-        # update password in case it changed
-        cur.execute(f"ALTER USER {user} WITH PASSWORD %s", (password,))
-        print(f"[PG_SETUP] user '{user}' already exists", flush=True)
-
-    # create database if not exists
-    cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (dbname,))
-    if not cur.fetchone():
-        cur.execute(f"CREATE DATABASE {dbname} OWNER {user}")
-        print(f"[PG_SETUP] database '{dbname}' created", flush=True)
-    else:
-        print(f"[PG_SETUP] database '{dbname}' already exists", flush=True)
-
-    cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {dbname} TO {user}")
-    conn.close()
-
-
-def _restart_pg(version: str) -> None:
-    print(f"[PG_SETUP] Restarting PostgreSQL {version}...", flush=True)
-    _run(f"sudo systemctl restart postgresql@{version}-main")
-    time.sleep(2)
-    print("[PG_SETUP] Restarted", flush=True)
-
-
-def auto_setup() -> str:
-    """
-    Full auto-setup flow. Returns the DSN to use for connections.
-    Skips everything if PG is already running and connectable.
-    Only runs setup when PG_HOST=localhost.
-    """
-    host = os.getenv("PG_HOST", "localhost")
-    dsn  = _dsn_from_env()
-
-    # skip setup entirely for remote hosts
-    if host not in ("localhost", "127.0.0.1"):
-        print("[PG_SETUP] Remote host — skipping auto-setup", flush=True)
-        return dsn
-
-    # fast path — already running and connectable
-    try:
-        conn = psycopg2.connect(dsn)
-        conn.close()
-        print("[PG_SETUP] PostgreSQL already running and connectable", flush=True)
-        return dsn
-    except Exception:
-        pass   # not yet ready — run setup
-
-    print("[PG_SETUP] Starting PostgreSQL auto-setup...", flush=True)
-
-    # 1. install if missing
-    if not _is_pg_installed():
-        _install_pg()
-
-    # 2. detect version
-    version = _detect_pg_version()
-    if not version:
-        raise RuntimeError("[PG_SETUP] Could not detect PostgreSQL version")
-    print(f"[PG_SETUP] Detected PostgreSQL version: {version}", flush=True)
-
-    # 3. ensure service is running
-    _ensure_service_running(version)
-
-    # 4. configure postgresql.conf and pg_hba.conf
-    _configure_pg(version)
-
-    # 5. create user and database
-    _create_user_and_db()
-
-    # 6. restart to apply config changes
-    _restart_pg(version)
-
-    # 7. verify final connection
-    for attempt in range(1, 6):
-        try:
-            conn = psycopg2.connect(dsn)
-            conn.close()
-            print("[PG_SETUP] Setup complete — connection verified", flush=True)
-            return dsn
-        except Exception as exc:
-            print(f"[PG_SETUP] Connection attempt {attempt}/5 failed: {exc}", flush=True)
-            time.sleep(3)
-
-    raise RuntimeError("[PG_SETUP] Setup completed but connection still failing")
-
-
-# ---------------------------------------------------------------------------
-# Per-symbol table helpers
-# ---------------------------------------------------------------------------
-
-def _safe_symbol(symbol: str) -> str:
-    return "".join(c for c in symbol if c.isalnum() or c == "_")
-
-
-def _ensure_table(
-    conn: psycopg2.extensions.connection,
-    prefix: str,
-    sym: str,
-    known_tables: Set[str],
-) -> str:
-    table = f"{prefix}_{_safe_symbol(sym)}"
-    if table in known_tables:
-        return table
-
-    cur = conn.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            timestamp  BIGINT NOT NULL,
-            ingest_ns  BIGINT,
-            raw_json   JSONB  NOT NULL
-        )
-    """)
-    cur.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (timestamp)"
-    )
-    conn.commit()
-    known_tables.add(table)
-    print(f"[PG_{prefix.upper()}] new table: {table}", flush=True)
-    return table
-
-
-def _load_existing_tables(
-    conn: psycopg2.extensions.connection,
-    prefix: str,
-) -> Set[str]:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT tablename FROM pg_tables "
-        "WHERE schemaname='public' AND tablename LIKE %s",
-        (f"{prefix}_%",),
-    )
-    tables = {row[0] for row in cur.fetchall()}
-    if tables:
-        print(
-            f"[PG_{prefix.upper()}] found {len(tables)} existing tables",
-            flush=True,
-        )
-    return tables
-
-
-@lru_cache(maxsize=256)
-def _insert_sql(table: str) -> str:
-    return f"INSERT INTO {table} (timestamp, ingest_ns, raw_json) VALUES %s"
-
-
-def _parse(row: dict) -> tuple:
-    raw       = row.get("raw_json", "{}")
-    d         = json.loads(raw) if isinstance(raw, str) else raw
-    ts_ms     = d.get("timestamp")
-    ingest_ns = row.get("ingest_ns")
-    return (
-        ts_ms,
-        ingest_ns,
-        raw if isinstance(raw, str) else json.dumps(raw),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Writer class
-# ---------------------------------------------------------------------------
 
 class PgWriter:
     """
     Mirrors one data stream (depth or quote) to PostgreSQL in real time.
 
-    On first run with PG_HOST=localhost:
-      - installs PostgreSQL if missing
-      - creates user and database from .env
-      - configures and starts the service
-      - all automatic, no manual steps needed
-
-    Per-symbol table layout matches SQLite writers exactly:
-      depth_RELIANCE, depth_TCS, quote_RELIANCE ...
-
-    Public interface:
-        writer = PgWriter(table='depth')
-        writer.enqueue(symbol, row)
-        writer.shutdown()
+    - Same queue-based threading model as the SQLite writers
+    - Reconnects automatically if PostgreSQL goes down
+    - On PG failure, ticks are NOT lost — SQLite writer has them
+    - Uses execute_values for bulk inserts (much faster than executemany in PG)
     """
 
     def __init__(
         self,
         table: str,
-        dsn: Optional[str] = None,
+        dsn: str,
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
     ):
@@ -361,12 +157,10 @@ class PgWriter:
             raise ValueError("table must be 'depth' or 'quote'")
 
         self.table  = table
+        self.dsn    = dsn
         self._tag   = f"[PG_{table.upper()}]"
         self.flush_batch_size   = max(1,   int(flush_batch_size))
         self.flush_interval_sec = max(0.2, float(flush_interval_sec))
-
-        # run auto-setup and get DSN
-        self._dsn = dsn or auto_setup()
 
         self._q      = queue.Queue()
         self._stop   = threading.Event()
@@ -376,7 +170,7 @@ class PgWriter:
         self._thread.start()
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — identical interface to SQLite writers
     # ------------------------------------------------------------------
 
     def enqueue(self, symbol: str, row: dict) -> None:
@@ -395,10 +189,17 @@ class PgWriter:
     # ------------------------------------------------------------------
 
     def _connect(self) -> Optional[psycopg2.extensions.connection]:
+        """
+        Keep retrying until PostgreSQL is reachable.
+        Runs in the writer thread — never blocks the main collector.
+        """
         while not self._stop.is_set():
             try:
-                conn = psycopg2.connect(self._dsn)
+                conn = psycopg2.connect(self.dsn)
                 conn.autocommit = False
+                cur  = conn.cursor()
+                cur.execute(_CREATE_SQL)
+                conn.commit()
                 print(f"{self._tag} connected to PostgreSQL", flush=True)
                 return conn
             except Exception as exc:
@@ -409,6 +210,26 @@ class PgWriter:
                 time.sleep(5)
         return None
 
+    @staticmethod
+    def _parse(symbol: str, row: dict) -> tuple:
+        """
+        Return (timestamp, ingest_ns, symbol, raw_json) for INSERT.
+        Matches SQLite column structure exactly.
+        timestamp and ingest_ns stored as raw integers — no conversion.
+        raw_json passed as string — PostgreSQL casts to JSONB automatically.
+        """
+        raw       = row.get("raw_json", "{}")
+        d         = json.loads(raw) if isinstance(raw, str) else raw
+        ts_ms     = d.get("timestamp", row.get("timestamp"))
+        ingest_ns = row.get("ingest_ns", row.get("ingest_ts_ns"))
+
+        return (
+            ts_ms,
+            ingest_ns,
+            symbol,
+            raw if isinstance(raw, str) else json.dumps(raw),
+        )
+
     def _run(self) -> None:
         buffered: Dict[str, List[dict]] = {}
         last_flush = time.monotonic()
@@ -417,7 +238,10 @@ class PgWriter:
         if conn is None:
             return
 
-        known_tables = _load_existing_tables(conn, self.table)
+        insert_sql = (
+            f"INSERT INTO {self.table} "
+            f"(timestamp, ingest_ns, symbol, raw_json) VALUES %s"
+        )
 
         while True:
             if self._stop.is_set() and self._q.empty():
@@ -435,10 +259,11 @@ class PgWriter:
             due_batch = any(len(r) >= self.flush_batch_size for r in buffered.values())
 
             if due_time or due_batch:
-                conn, known_tables = self._flush(conn, buffered, known_tables)
+                conn       = self._flush(conn, buffered, insert_sql)
                 last_flush = now
 
-        self._flush(conn, buffered, known_tables)
+        # drain on exit
+        self._flush(conn, buffered, insert_sql)
         if conn:
             try:
                 conn.close()
@@ -449,50 +274,43 @@ class PgWriter:
         self,
         conn: Optional[psycopg2.extensions.connection],
         buffered: Dict[str, List[dict]],
-        known_tables: Set[str],
-    ):
-        any_rows = False
+        insert_sql: str,
+    ) -> Optional[psycopg2.extensions.connection]:
+        """
+        Bulk insert all buffered rows across all symbols in one execute_values call.
+        execute_values sends everything as one multi-row SQL statement —
+        much faster than executemany for PostgreSQL.
+        On failure reconnects — next flush retries automatically.
+        """
+        parsed: List[tuple] = []
 
         for sym, rows in buffered.items():
-            if not rows:
-                continue
-
-            try:
-                table = _ensure_table(conn, self.table, sym, known_tables)
-            except Exception as exc:
-                print(f"{self._tag}[ERROR] ensure table failed for {sym}: {exc}", flush=True)
-                buffered[sym] = []
-                continue
-
-            sql    = _insert_sql(table)
-            parsed: List[tuple] = []
-
             for row in rows:
                 try:
-                    parsed.append(_parse(row))
+                    parsed.append(self._parse(sym, row))
                 except Exception as exc:
-                    print(f"{self._tag}[ERROR] parse failed for {sym}: {exc}", flush=True)
-
-            if parsed:
-                try:
-                    cur = conn.cursor()
-                    psycopg2.extras.execute_values(cur, sql, parsed)
-                    any_rows = True
-                except Exception as exc:
-                    print(f"{self._tag}[ERROR] insert failed for {sym}: {exc}", flush=True)
-
+                    print(
+                        f"{self._tag}[ERROR] parse failed for {sym}: {exc}",
+                        flush=True,
+                    )
             buffered[sym] = []
 
-        if any_rows:
-            try:
-                conn.commit()
-            except Exception as exc:
-                print(f"{self._tag}[ERROR] commit failed: {exc} — reconnecting", flush=True)
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = self._connect()
-                known_tables = _load_existing_tables(conn, self.table) if conn else set()
+        if not parsed:
+            return conn
 
-        return conn, known_tables
+        try:
+            cur = conn.cursor()
+            psycopg2.extras.execute_values(cur, insert_sql, parsed)
+            conn.commit()
+        except Exception as exc:
+            print(
+                f"{self._tag}[ERROR] insert failed: {exc} — reconnecting",
+                flush=True,
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = self._connect()
+
+        return conn
