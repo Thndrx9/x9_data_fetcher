@@ -78,10 +78,6 @@ def _dsn_from_env() -> str:
     return f"host={host} port={port} dbname={dbname} user={user} password={password}"
 
 
-def _superuser_dsn() -> str:
-    # No host = Unix socket connection = peer auth for postgres user
-    # peer auth never needs a password — works on all Ubuntu installs
-    return "dbname=postgres user=postgres"
 
 
 # ---------------------------------------------------------------------------
@@ -198,32 +194,41 @@ def _configure_pg(version: str) -> None:
 
 
 def _create_user_and_db() -> None:
-    """Create PG user and database using superuser connection."""
+    """
+    Create PG user and database using sudo -u postgres psql.
+    Avoids peer auth issue — script runs as ubuntu, not postgres.
+    """
     user     = os.getenv("PG_USER",     "collector")
     password = os.getenv("PG_PASSWORD", "")
     dbname   = os.getenv("PG_DBNAME",   "market")
 
-    conn = psycopg2.connect(_superuser_dsn())
-    conn.autocommit = True
-    cur  = conn.cursor()
+    # escape single quotes in password for SQL safety
+    safe_pw = password.replace("'", "''")
 
-    cur.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (user,))
-    if not cur.fetchone():
-        cur.execute(f"CREATE USER {user} WITH PASSWORD %s", (password,))
+    def _psql(sql: str) -> subprocess.CompletedProcess:
+        """Run SQL as postgres superuser via sudo."""
+        return subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-c", sql],
+            capture_output=True, text=True,
+        )
+
+    # create user or update password if already exists
+    result = _psql(f"CREATE USER {user} WITH PASSWORD '{safe_pw}'")
+    if "already exists" in result.stderr:
+        _psql(f"ALTER USER {user} WITH PASSWORD '{safe_pw}'")
+        print(f"[PG_SETUP] user '{user}' already exists — password updated", flush=True)
+    else:
         print(f"[PG_SETUP] user '{user}' created", flush=True)
-    else:
-        cur.execute(f"ALTER USER {user} WITH PASSWORD %s", (password,))
-        print(f"[PG_SETUP] user '{user}' already exists", flush=True)
 
-    cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (dbname,))
-    if not cur.fetchone():
-        cur.execute(f"CREATE DATABASE {dbname} OWNER {user}")
-        print(f"[PG_SETUP] database '{dbname}' created", flush=True)
-    else:
+    # create database if not exists
+    result = _psql(f"CREATE DATABASE {dbname} OWNER {user}")
+    if "already exists" in result.stderr:
         print(f"[PG_SETUP] database '{dbname}' already exists", flush=True)
+    else:
+        print(f"[PG_SETUP] database '{dbname}' created", flush=True)
 
-    cur.execute(f"GRANT ALL PRIVILEGES ON DATABASE {dbname} TO {user}")
-    conn.close()
+    _psql(f"GRANT ALL PRIVILEGES ON DATABASE {dbname} TO {user}")
+    print(f"[PG_SETUP] privileges granted to '{user}'", flush=True)
 
 
 def _restart_pg(version: str) -> None:
