@@ -69,13 +69,19 @@ IST = ZoneInfo("Asia/Kolkata")
 # Credentials — read from environment
 # ---------------------------------------------------------------------------
 
-def _dsn_from_env() -> str:
-    host     = os.getenv("PG_HOST",     "localhost")
-    port     = os.getenv("PG_PORT",     "5432")
-    user     = os.getenv("PG_USER",     "collector")
-    password = os.getenv("PG_PASSWORD", "")
-    dbname   = os.getenv("PG_DBNAME",   "market")
-    return f"host={host} port={port} dbname={dbname} user={user} password={password}"
+def _conn_params() -> dict:
+    """
+    Return connection params as a dict — never as a DSN string.
+    DSN strings treat # as a comment character which breaks passwords like Thnd@9#
+    Using keyword args bypasses all DSN string parsing entirely.
+    """
+    return {
+        "host":     os.getenv("PG_HOST",     "localhost"),
+        "port":     int(os.getenv("PG_PORT", "5432")),
+        "dbname":   os.getenv("PG_DBNAME",   "market"),
+        "user":     os.getenv("PG_USER",     "collector"),
+        "password": os.getenv("PG_PASSWORD", ""),
+    }
 
 
 
@@ -251,26 +257,26 @@ def _restart_pg(version: str) -> None:
     print("[PG_SETUP] Restarted", flush=True)
 
 
-def auto_setup() -> str:
+def auto_setup() -> dict:
     """
-    Full auto-setup. Returns the DSN to use for connections.
+    Full auto-setup. Returns conn_params dict for psycopg2.connect(**params).
     Skips everything instantly if PG is already running and connectable.
     Only runs setup when PG_HOST is localhost or 127.0.0.1.
     """
-    host = os.getenv("PG_HOST", "localhost")
-    dsn  = _dsn_from_env()
+    host   = os.getenv("PG_HOST", "localhost")
+    params = _conn_params()
 
     # skip setup for remote hosts
     if host not in ("localhost", "127.0.0.1"):
         print("[PG_SETUP] Remote host — skipping auto-setup", flush=True)
-        return dsn
+        return params
 
     # fast path — already running and connectable
     try:
-        conn = psycopg2.connect(dsn)
+        conn = psycopg2.connect(**params)
         conn.close()
         print("[PG_SETUP] PostgreSQL already running and connectable", flush=True)
-        return dsn
+        return params
     except Exception:
         pass
 
@@ -291,10 +297,10 @@ def auto_setup() -> str:
 
     for attempt in range(1, 6):
         try:
-            conn = psycopg2.connect(dsn)
+            conn = psycopg2.connect(**params)
             conn.close()
             print("[PG_SETUP] Setup complete — connection verified", flush=True)
-            return dsn
+            return params
         except Exception as exc:
             print(f"[PG_SETUP] Connection attempt {attempt}/5: {exc}", flush=True)
             time.sleep(3)
@@ -414,8 +420,13 @@ class PgWriter:
         self.flush_batch_size   = max(1,   int(flush_batch_size))
         self.flush_interval_sec = max(0.2, float(flush_interval_sec))
 
-        # auto_setup handles install + config + DB creation if needed
-        self._dsn = dsn or auto_setup()
+        # use conn params dict — avoids DSN string parsing issues with
+        # special characters like # in passwords being treated as comments
+        if dsn:
+            # legacy DSN string passed directly — convert to dict via libpq
+            self._params = {"dsn": dsn}
+        else:
+            self._params = auto_setup()
 
         self._q      = queue.Queue()
         self._stop   = threading.Event()
@@ -438,7 +449,7 @@ class PgWriter:
     def _connect(self) -> Optional[psycopg2.extensions.connection]:
         while not self._stop.is_set():
             try:
-                conn = psycopg2.connect(self._dsn)
+                conn = psycopg2.connect(**self._params)
                 conn.autocommit = False
                 print(f"{self._tag} connected to PostgreSQL", flush=True)
                 return conn
