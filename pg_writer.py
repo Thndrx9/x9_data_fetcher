@@ -165,6 +165,7 @@ def _configure_pg(version: str) -> None:
         "work_mem":         "2MB",
         "max_connections":  "10",
         "wal_level":        "minimal",
+        "max_wal_senders":  "0",       # required when wal_level=minimal
     }
 
     for key, val in settings.items():
@@ -233,7 +234,21 @@ def _create_user_and_db() -> None:
 
 def _restart_pg(version: str) -> None:
     print(f"[PG_SETUP] Restarting PostgreSQL {version}...", flush=True)
-    _run(f"sudo systemctl restart postgresql@{version}-main")
+    result = subprocess.run(
+        f"sudo systemctl restart postgresql@{version}-main",
+        shell=True, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        # fetch last 20 lines of journal for diagnosis
+        logs = subprocess.run(
+            f"sudo journalctl -u postgresql@{version}-main -n 20 --no-pager",
+            shell=True, capture_output=True, text=True,
+        )
+        raise RuntimeError(
+            f"PostgreSQL restart failed.\n"
+            f"stderr: {result.stderr.strip()}\n"
+            f"logs:\n{logs.stdout.strip()}"
+        )
     time.sleep(2)
     print("[PG_SETUP] Restarted", flush=True)
 
