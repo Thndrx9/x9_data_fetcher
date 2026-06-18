@@ -164,8 +164,6 @@ def _configure_pg(version: str) -> None:
         "shared_buffers":   "64MB",
         "work_mem":         "2MB",
         "max_connections":  "10",
-        "wal_level":        "minimal",
-        "max_wal_senders":  "0",       # required when wal_level=minimal
     }
 
     for key, val in settings.items():
