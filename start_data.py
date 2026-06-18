@@ -24,6 +24,7 @@ from x9_data_fetcher.market_time import (
     seconds_until_pre_connect,
 )
 from x9_data_fetcher.symbols import load_symbols
+from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup
 from x9_data_fetcher.websocket_connect import websocket_client
 
 
@@ -68,6 +69,11 @@ async def run_engine():
     symbols = load_symbols(symbols_csv)
     if not symbols:
         raise RuntimeError(f"No symbols found in {symbols_csv}")
+
+    # run PG setup at startup so PostgreSQL is ready before market opens
+    # skips instantly if already running, installs+configures if missing
+    if os.getenv("PG_HOST", "").strip() or os.getenv("X9_PG_DSN", "").strip():
+        pg_auto_setup()
 
     instruments = [{"exchange": s["exchange"], "symbol": s["symbol"]} for s in symbols]
 
