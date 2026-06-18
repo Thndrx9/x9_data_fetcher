@@ -94,6 +94,18 @@ def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
+def _sudo_read(path: Path) -> str:
+    """Read file using sudo cat — needed for /etc/postgresql/ files."""
+    result = subprocess.run(
+        ["sudo", "cat", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to read {path}: {result.stderr}")
+    return result.stdout
+
+
 def _sudo_write(path: Path, content: str) -> None:
     """Write file using sudo tee — needed for /etc/postgresql/ files."""
     result = subprocess.run(
@@ -148,7 +160,7 @@ def _configure_pg(version: str) -> None:
     hba_path  = Path(f"/etc/postgresql/{version}/main/pg_hba.conf")
 
     # --- postgresql.conf ---
-    conf_text = conf_path.read_text()
+    conf_text = _sudo_read(conf_path)
     changes   = False
 
     settings = {
@@ -179,7 +191,7 @@ def _configure_pg(version: str) -> None:
     dbname   = os.getenv("PG_DBNAME", "market")
     hba_line = f"host    {dbname}    {user}    0.0.0.0/0    scram-sha-256\n"
 
-    hba_text = hba_path.read_text()
+    hba_text = _sudo_read(hba_path)
     if hba_line.strip() not in hba_text:
         _sudo_write(hba_path, hba_text + "\n" + hba_line)
         print("[PG_SETUP] pg_hba.conf updated", flush=True)
