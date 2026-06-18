@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -106,20 +107,27 @@ class MarketDataFetcher:
         self.depth_pg_writer = None
         self.quote_pg_writer = None
 
-        if pg_dsn:
+        # X9_PG_DSN takes priority if set.
+        # Otherwise fall back to individual PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME.
+        # PgWriter.auto_setup() reads those vars, installs PG if missing,
+        # creates the DB and handles all configuration automatically.
+        pg_host = os.getenv("PG_HOST", "").strip()
+        use_pg  = bool(pg_dsn or pg_host)
+
+        if use_pg:
             if PgWriter is None:
                 raise RuntimeError(
                     "PG writer requested but psycopg2 is not available"
                 )
             self.depth_pg_writer = PgWriter(
                 table="depth",
-                dsn=pg_dsn,
+                dsn=pg_dsn or None,   # None → auto_setup() builds DSN from PG_* env vars
                 flush_batch_size=flush_batch_size,
                 flush_interval_sec=flush_interval_sec,
             )
             self.quote_pg_writer = PgWriter(
                 table="quote",
-                dsn=pg_dsn,
+                dsn=pg_dsn or None,
                 flush_batch_size=flush_batch_size,
                 flush_interval_sec=flush_interval_sec,
             )
