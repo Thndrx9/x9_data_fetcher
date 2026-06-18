@@ -79,9 +79,9 @@ def _dsn_from_env() -> str:
 
 
 def _superuser_dsn() -> str:
-    host = os.getenv("PG_HOST", "localhost")
-    port = os.getenv("PG_PORT", "5432")
-    return f"host={host} port={port} dbname=postgres user=postgres"
+    # No host = Unix socket connection = peer auth for postgres user
+    # peer auth never needs a password — works on all Ubuntu installs
+    return "dbname=postgres user=postgres"
 
 
 # ---------------------------------------------------------------------------
