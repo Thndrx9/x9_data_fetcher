@@ -15,6 +15,7 @@ from x9_data_fetcher.venv_setup import create_and_activate_venv
 
 create_and_activate_venv()
 
+from x9_data_fetcher.backfill_manager import BackfillManager
 from x9_data_fetcher.data_fetcher import MarketDataFetcher
 from x9_data_fetcher.event_bus import market_data_queue
 from x9_data_fetcher.market_time import (
@@ -146,6 +147,28 @@ async def run_engine():
             ),
             asyncio.create_task(fetcher.run()),
         ]
+
+        backfill_enabled = os.getenv("X9_BACKFILL_ENABLED", "1").strip().lower()
+        backfill_enabled = backfill_enabled not in ("0", "false", "no", "off")
+        pg_configured = bool(
+            os.getenv("PG_HOST", "").strip()
+            or os.getenv("PG_HDBNAME", "").strip()
+            or pg_dsn
+        )
+        if backfill_enabled and pg_configured:
+            tasks.append(
+                asyncio.create_task(
+                    BackfillManager(
+                        symbols=symbols,
+                        quote_output_dir=quote_output_dir,
+                        api_key=api_key,
+                        flush_batch_size=flush_batch,
+                        flush_interval_sec=flush_interval,
+                    ).run()
+                )
+            )
+        elif backfill_enabled:
+            print("[BACKFILL] skipped because PostgreSQL is not configured", flush=True)
 
         print(
             f"[X9_FETCHER] Session started at "

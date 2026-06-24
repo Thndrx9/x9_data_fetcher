@@ -6,7 +6,7 @@ On first run (localhost only):
   - starts the service
   - detects version automatically (no hardcoded version)
   - configures listen_addresses and pg_hba.conf using sudo tee
-  - creates user and database from .env credentials
+  - creates user and live/history databases from .env credentials
   - verifies connection
 
 After first successful setup, all setup steps are skipped instantly on restart.
@@ -18,6 +18,7 @@ After first successful setup, all setup steps are skipped instantly on restart.
     PG_USER      = collector
     PG_PASSWORD  = yourpassword
     PG_DBNAME    = market
+    PG_HDBNAME   = market_history
 
 Table layout (matches SQLite writers exactly — one table per symbol)
 ---------------------------------------------------------------------
@@ -69,7 +70,27 @@ IST = ZoneInfo("Asia/Kolkata")
 # Credentials — read from environment
 # ---------------------------------------------------------------------------
 
-def _conn_params() -> dict:
+def _history_dbname() -> str:
+    return os.getenv("PG_HDBNAME", "market_history").strip() or "market_history"
+
+
+def _configured_dbnames() -> List[str]:
+    dbnames = [
+        os.getenv("PG_DBNAME", "market").strip() or "market",
+        _history_dbname(),
+    ]
+    out: List[str] = []
+    for dbname in dbnames:
+        if dbname not in out:
+            out.append(dbname)
+    return out
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _conn_params(dbname: Optional[str] = None) -> dict:
     """
     Return connection params as a dict — never as a DSN string.
     DSN strings treat # as a comment character which breaks passwords like Thnd@9#
@@ -78,7 +99,7 @@ def _conn_params() -> dict:
     return {
         "host":     os.getenv("PG_HOST",     "localhost"),
         "port":     int(os.getenv("PG_PORT", "5432")),
-        "dbname":   os.getenv("PG_DBNAME",   "market"),
+        "dbname":   dbname or os.getenv("PG_DBNAME", "market"),
         "user":     os.getenv("PG_USER",     "collector"),
         "password": os.getenv("PG_PASSWORD", ""),
     }
@@ -189,12 +210,14 @@ def _configure_pg(version: str) -> None:
 
     # --- pg_hba.conf ---
     user     = os.getenv("PG_USER",   "collector")
-    dbname   = os.getenv("PG_DBNAME", "market")
-    hba_line = f"host    {dbname}    {user}    0.0.0.0/0    scram-sha-256\n"
-
     hba_text = _sudo_read(hba_path)
-    if hba_line.strip() not in hba_text:
-        _sudo_write(hba_path, hba_text + "\n" + hba_line)
+    hba_lines = [
+        f"host    {dbname}    {user}    0.0.0.0/0    scram-sha-256\n"
+        for dbname in _configured_dbnames()
+    ]
+    missing = [line for line in hba_lines if line.strip() not in hba_text]
+    if missing:
+        _sudo_write(hba_path, hba_text + "\n" + "".join(missing))
         print("[PG_SETUP] pg_hba.conf updated", flush=True)
 
 
@@ -205,7 +228,7 @@ def _create_user_and_db() -> None:
     """
     user     = os.getenv("PG_USER",     "collector")
     password = os.getenv("PG_PASSWORD", "")
-    dbname   = os.getenv("PG_DBNAME",   "market")
+    dbnames  = _configured_dbnames()
 
     # escape single quotes in password for SQL safety
     safe_pw = password.replace("'", "''")
@@ -218,22 +241,25 @@ def _create_user_and_db() -> None:
         )
 
     # create user or update password if already exists
-    result = _psql(f"CREATE USER {user} WITH PASSWORD '{safe_pw}'")
+    safe_user = _quote_ident(user)
+
+    result = _psql(f"CREATE USER {safe_user} WITH PASSWORD '{safe_pw}'")
     if "already exists" in result.stderr:
-        _psql(f"ALTER USER {user} WITH PASSWORD '{safe_pw}'")
+        _psql(f"ALTER USER {safe_user} WITH PASSWORD '{safe_pw}'")
         print(f"[PG_SETUP] user '{user}' already exists — password updated", flush=True)
     else:
         print(f"[PG_SETUP] user '{user}' created", flush=True)
 
-    # create database if not exists
-    result = _psql(f"CREATE DATABASE {dbname} OWNER {user}")
-    if "already exists" in result.stderr:
-        print(f"[PG_SETUP] database '{dbname}' already exists", flush=True)
-    else:
-        print(f"[PG_SETUP] database '{dbname}' created", flush=True)
+    for dbname in dbnames:
+        safe_dbname = _quote_ident(dbname)
+        result = _psql(f"CREATE DATABASE {safe_dbname} OWNER {safe_user}")
+        if "already exists" in result.stderr:
+            print(f"[PG_SETUP] database '{dbname}' already exists", flush=True)
+        else:
+            print(f"[PG_SETUP] database '{dbname}' created", flush=True)
 
-    _psql(f"GRANT ALL PRIVILEGES ON DATABASE {dbname} TO {user}")
-    print(f"[PG_SETUP] privileges granted to '{user}'", flush=True)
+        _psql(f"GRANT ALL PRIVILEGES ON DATABASE {safe_dbname} TO {safe_user}")
+        print(f"[PG_SETUP] privileges granted on '{dbname}' to '{user}'", flush=True)
 
 
 def _restart_pg(version: str) -> None:
@@ -257,14 +283,14 @@ def _restart_pg(version: str) -> None:
     print("[PG_SETUP] Restarted", flush=True)
 
 
-def auto_setup() -> dict:
+def auto_setup(dbname: Optional[str] = None) -> dict:
     """
     Full auto-setup. Returns conn_params dict for psycopg2.connect(**params).
     Skips everything instantly if PG is already running and connectable.
     Only runs setup when PG_HOST is localhost or 127.0.0.1.
     """
     host   = os.getenv("PG_HOST", "localhost")
-    params = _conn_params()
+    params = _conn_params(dbname)
 
     # skip setup for remote hosts
     if host not in ("localhost", "127.0.0.1"):
@@ -273,8 +299,9 @@ def auto_setup() -> dict:
 
     # fast path — already running and connectable
     try:
-        conn = psycopg2.connect(**params)
-        conn.close()
+        for check_dbname in _configured_dbnames():
+            conn = psycopg2.connect(**_conn_params(check_dbname))
+            conn.close()
         print("[PG_SETUP] PostgreSQL already running and connectable", flush=True)
         return params
     except Exception:
@@ -297,8 +324,9 @@ def auto_setup() -> dict:
 
     for attempt in range(1, 6):
         try:
-            conn = psycopg2.connect(**params)
-            conn.close()
+            for check_dbname in _configured_dbnames():
+                conn = psycopg2.connect(**_conn_params(check_dbname))
+                conn.close()
             print("[PG_SETUP] Setup complete — connection verified", flush=True)
             return params
         except Exception as exc:
@@ -393,7 +421,7 @@ class PgWriter:
 
     On first run with PG_HOST=localhost:
       - installs PostgreSQL if missing
-      - creates user and database from .env
+      - creates user and live/history databases from .env
       - configures and starts the service automatically
 
     Per-symbol table layout matches SQLite writers exactly:
@@ -409,6 +437,7 @@ class PgWriter:
         self,
         table: str,
         dsn: Optional[str] = None,
+        dbname: Optional[str] = None,
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
     ):
@@ -426,7 +455,7 @@ class PgWriter:
             # legacy DSN string passed directly — convert to dict via libpq
             self._params = {"dsn": dsn}
         else:
-            self._params = auto_setup()
+            self._params = auto_setup(dbname=dbname)
 
         self._q      = queue.Queue()
         self._stop   = threading.Event()
