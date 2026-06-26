@@ -15,7 +15,7 @@ from x9_data_fetcher.venv_setup import create_and_activate_venv
 
 create_and_activate_venv()
 
-from x9_data_fetcher.backfill_manager import BackfillManager
+from x9_data_fetcher.backfill_manager import BackfillManager, latest_collected_timestamp
 from x9_data_fetcher.data_fetcher import MarketDataFetcher
 from x9_data_fetcher.event_bus import market_data_queue
 from x9_data_fetcher.market_time import (
@@ -116,6 +116,11 @@ async def run_engine():
 
         _drain_queue()
 
+        # capture BEFORE websocket starts writing live ticks
+        # backfill uses this to find today's gap without reading fresh live data
+        # None on first startup — backfill_manager handles that case internally
+        pre_startup_ts = latest_collected_timestamp(quote_output_dir)
+
         fetcher = MarketDataFetcher(
             depth_output_dir=depth_output_dir,
             quote_output_dir=quote_output_dir,
@@ -164,6 +169,7 @@ async def run_engine():
                         api_key=api_key,
                         flush_batch_size=flush_batch,
                         flush_interval_sec=flush_interval,
+                        last_known_timestamp=pre_startup_ts,
                     ).run()
                 )
             )
