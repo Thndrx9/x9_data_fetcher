@@ -194,14 +194,15 @@ def _find_symbol_gaps(
             if not is_trading_day(now):
                 continue
 
-            if pre_startup_ts is not None:
-                # normal restart — backfill from after last known tick
+            if pre_startup_ts is not None and pre_startup_ts.date() == day:
+                # restarted mid-session today — gap from last tick to now
                 gap_start = _floor_minute(pre_startup_ts) + timedelta(minutes=1)
             elif now.time() >= MARKET_OPEN:
-                # first ever startup during market hours
+                # first startup today OR pre_startup_ts is from a previous day
+                # in both cases fetch from today's session open
                 gap_start = _session_open(day)
             else:
-                continue                # market not open yet, nothing to backfill
+                continue                # market not open yet
 
             gap_end = _latest_completed_candle(now)
             if gap_end and gap_start <= gap_end:
@@ -545,7 +546,8 @@ class BackfillManager:
 
         try:
             with request.urlopen(http_request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                raw_response = response.read().decode("utf-8")
+                payload = json.loads(raw_response)
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
             print(
                 f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol}: {exc}",
@@ -564,5 +566,14 @@ class BackfillManager:
             normalized = _normalize_candle(row, symbol, exchange, self.interval)
             if normalized:
                 candles.append(normalized)
+
+        if not candles:
+            # log the raw response so we can diagnose API issues
+            preview = raw_response[:300] if len(raw_response) > 300 else raw_response
+            print(
+                f"[BACKFILL][WARN] 0 candles from API for {exchange}:{symbol} "
+                f"{window_start.strftime('%Y-%m-%d')} — response: {preview}",
+                flush=True,
+            )
 
         return candles
