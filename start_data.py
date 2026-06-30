@@ -185,7 +185,17 @@ async def run_engine():
             asyncio.create_task(fetcher.run()),
         ]
 
-        if backfill_enabled and pg_configured:
+        if (
+            backfill_enabled
+            and pg_configured
+            and startup_backfill_task
+            and not startup_backfill_task.done()
+        ):
+            print(
+                "[BACKFILL] session backfill skipped — startup backfill still running",
+                flush=True,
+            )
+        elif backfill_enabled and pg_configured:
             tasks.append(
                 asyncio.create_task(
                     BackfillManager(
