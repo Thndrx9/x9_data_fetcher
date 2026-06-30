@@ -744,43 +744,66 @@ class BackfillManager:
             "source":     "api",
         }
         data         = json.dumps(body).encode("utf-8")
-        http_request = request.Request(
-            self.endpoint,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with request.urlopen(http_request, timeout=30) as response:
-                raw_response = response.read().decode("utf-8")
-                payload = json.loads(raw_response)
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            print(
-                f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol}: {exc}",
-                flush=True,
-            )
-            return []
-
         start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
         end_ms   = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
-        candles: List[dict] = []
+        max_attempts = 3
+        last_response = ""
 
-        for row in _extract_candle_rows(payload):
-            ts_ms = _row_timestamp(row)
-            if ts_ms is None or ts_ms < start_ms or ts_ms > end_ms:
-                continue
-            normalized = _normalize_candle(row, symbol, exchange, self.interval)
-            if normalized:
-                candles.append(normalized)
-
-        if not candles:
-            # log the raw response so we can diagnose API issues
-            preview = raw_response[:300] if len(raw_response) > 300 else raw_response
-            print(
-                f"[BACKFILL][WARN] 0 candles from API for {exchange}:{symbol} "
-                f"{window_start.strftime('%Y-%m-%d')} — response: {preview}",
-                flush=True,
+        for attempt in range(1, max_attempts + 1):
+            http_request = request.Request(
+                self.endpoint,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
+            candles: List[dict] = []
 
-        return candles
+            try:
+                with request.urlopen(http_request, timeout=30) as response:
+                    raw_response = response.read().decode("utf-8")
+                    last_response = raw_response
+                    payload = json.loads(raw_response)
+            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+                if attempt < max_attempts:
+                    print(
+                        f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol} "
+                        f"(attempt {attempt}/{max_attempts}): {exc}; retrying in 1s",
+                        flush=True,
+                    )
+                    time.sleep(1)
+                    continue
+                print(
+                    f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol}: {exc}",
+                    flush=True,
+                )
+                return []
+
+            for row in _extract_candle_rows(payload):
+                ts_ms = _row_timestamp(row)
+                if ts_ms is None or ts_ms < start_ms or ts_ms > end_ms:
+                    continue
+                normalized = _normalize_candle(row, symbol, exchange, self.interval)
+                if normalized:
+                    candles.append(normalized)
+
+            if candles:
+                return candles
+
+            if attempt < max_attempts:
+                print(
+                    f"[BACKFILL][WARN] 0 candles from API for {exchange}:{symbol} "
+                    f"{window_start.strftime('%Y-%m-%d')} "
+                    f"(attempt {attempt}/{max_attempts}); retrying in 1s",
+                    flush=True,
+                )
+                time.sleep(1)
+
+        preview = last_response[:300] if len(last_response) > 300 else last_response
+        print(
+            f"[BACKFILL][WARN] 0 candles from API for {exchange}:{symbol} "
+            f"{window_start.strftime('%Y-%m-%d')} after {max_attempts} attempts "
+            f"— response: {preview}",
+            flush=True,
+        )
+
+        return []
