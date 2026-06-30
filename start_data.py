@@ -21,6 +21,7 @@ from x9_data_fetcher.event_bus import market_data_queue
 from x9_data_fetcher.market_time import (
     is_connectable,
     now_kolkata,
+    refresh_trading_calendar,
     seconds_until_close,
     seconds_until_pre_connect,
 )
@@ -71,6 +72,9 @@ async def run_engine():
     if not symbols:
         raise RuntimeError(f"No symbols found in {symbols_csv}")
 
+    # Refresh trading calendar from NSE if stale (>7 days) or has no future holidays
+    refresh_trading_calendar()
+
     # run PG setup at startup so PostgreSQL is ready before market opens
     # skips instantly if already running, installs+configures if missing
     if os.getenv("PG_HOST", "").strip() or os.getenv("X9_PG_DSN", "").strip():
@@ -88,6 +92,34 @@ async def run_engine():
         f"[X9_FETCHER] Initialized | symbols={len(instruments)} | ws={ws_url}",
         flush=True,
     )
+
+    # ── Evaluate backfill / PG config once (reused in both startup and session) ──
+    backfill_enabled = os.getenv("X9_BACKFILL_ENABLED", "1").strip().lower()
+    backfill_enabled = backfill_enabled not in ("0", "false", "no", "off")
+    pg_configured = bool(
+        os.getenv("PG_HOST", "").strip()
+        or os.getenv("PG_HDBNAME", "").strip()
+        or pg_dsn
+    )
+
+    # ── Startup backfill — fires immediately at script launch, independent of
+    #    session schedule.  Recovers past days without waiting for 09:14. ──
+    startup_backfill_task = None
+    if backfill_enabled and pg_configured:
+        pre_startup_ts = latest_collected_timestamp(quote_output_dir)
+        startup_backfill_task = asyncio.create_task(
+            BackfillManager(
+                symbols=symbols,
+                quote_output_dir=quote_output_dir,
+                api_key=api_key,
+                flush_batch_size=flush_batch,
+                flush_interval_sec=flush_interval,
+                last_known_timestamp=pre_startup_ts,
+            ).run()
+        )
+        print("[X9_FETCHER] Startup backfill task launched", flush=True)
+    elif backfill_enabled:
+        print("[BACKFILL] startup backfill skipped — PostgreSQL not configured", flush=True)
 
     # ── Daily loop ──────────────────────────────────────────────────────
     while not manual_stop.is_set():
@@ -153,13 +185,6 @@ async def run_engine():
             asyncio.create_task(fetcher.run()),
         ]
 
-        backfill_enabled = os.getenv("X9_BACKFILL_ENABLED", "1").strip().lower()
-        backfill_enabled = backfill_enabled not in ("0", "false", "no", "off")
-        pg_configured = bool(
-            os.getenv("PG_HOST", "").strip()
-            or os.getenv("PG_HDBNAME", "").strip()
-            or pg_dsn
-        )
         if backfill_enabled and pg_configured:
             tasks.append(
                 asyncio.create_task(
@@ -202,6 +227,10 @@ async def run_engine():
         fetcher.shutdown()
 
         if manual_stop.is_set():
+            # Cancel startup backfill if it's still running
+            if startup_backfill_task and not startup_backfill_task.done():
+                startup_backfill_task.cancel()
+                await asyncio.gather(startup_backfill_task, return_exceptions=True)
             print("[X9_FETCHER] Manual shutdown complete", flush=True)
             break
 

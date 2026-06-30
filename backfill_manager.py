@@ -21,6 +21,10 @@ from x9_data_fetcher.pg_writer import PgWriter
 
 HistoryWindow = Tuple[datetime, datetime]
 
+# Second-level gap detection constants
+_GAP_TOLERANCE_MS   = 90_000   # 90 s — absorbs minor tick-timing jitter
+_CANDLE_INTERVAL_MS = 60_000   # 1-minute candle width
+
 
 # ---------------------------------------------------------------------------
 # Timestamp helpers
@@ -133,10 +137,12 @@ def _candidate_db_paths(base_dir: Path) -> List[Path]:
     return sorted(base_dir.glob("market_*.db"), key=lambda p: p.name, reverse=True)
 
 
-def _has_data_for_day(db_paths: List[Path], table: str, day: date) -> bool:
+def _get_timestamps_for_day(
+    db_paths: List[Path], table: str, day: date
+) -> List[int]:
     """
-    Return True if any live SQLite DB has at least one quote row
-    for this symbol on this trading day (session window only).
+    Pull every raw timestamp (ms) stored for *symbol* on *day* across all
+    SQLite DB files.  Returns a sorted, deduplicated list.
     """
     day_start_ms = int(
         datetime.combine(day, MARKET_OPEN, tzinfo=tz_kolkata).timestamp() * 1000
@@ -144,6 +150,7 @@ def _has_data_for_day(db_paths: List[Path], table: str, day: date) -> bool:
     day_end_ms = int(
         datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata).timestamp() * 1000
     )
+    timestamps: List[int] = []
 
     for db_path in db_paths:
         try:
@@ -156,17 +163,73 @@ def _has_data_for_day(db_paths: List[Path], table: str, day: date) -> bool:
                 if not cur.fetchone():
                     continue
                 cur = conn.execute(
-                    f"SELECT 1 FROM {table} "
-                    f"WHERE timestamp >= ? AND timestamp < ? LIMIT 1",
+                    f"SELECT timestamp FROM {table} "
+                    f"WHERE timestamp >= ? AND timestamp < ?",
                     (day_start_ms, day_end_ms),
                 )
-                if cur.fetchone():
-                    return True
+                for (raw_ts,) in cur.fetchall():
+                    ts_ms = _to_ms(raw_ts)
+                    if ts_ms is not None:
+                        timestamps.append(ts_ms)
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            print(f"[BACKFILL][WARN] error scanning {db_path.name}: {exc}", flush=True)
-    return False
+            print(f"[BACKFILL][WARN] error reading {db_path.name}: {exc}", flush=True)
+
+    return sorted(set(timestamps))
+
+
+def _second_level_gaps(
+    timestamps_ms: List[int],
+    session_start: datetime,
+    session_end: datetime,
+) -> List[HistoryWindow]:
+    """
+    Walk a sorted timestamp sequence and return every missing window.
+
+    Leading edge  — gap before the first tick
+    Middle gaps   — consecutive pair separation > candle_interval + tolerance
+    Trailing edge — gap after the last tick before session_end
+    """
+    if session_start > session_end:
+        return []
+
+    session_start_ms = int(session_start.astimezone(timezone.utc).timestamp() * 1000)
+    session_end_ms   = int(session_end.astimezone(timezone.utc).timestamp() * 1000)
+
+    # Keep only timestamps that fall inside (or just beyond) the session window
+    ts = sorted(
+        t for t in timestamps_ms
+        if session_start_ms <= t <= session_end_ms + _GAP_TOLERANCE_MS
+    )
+
+    if not ts:
+        return [(session_start, session_end)]
+
+    gaps: List[HistoryWindow] = []
+
+    # ── leading edge ─────────────────────────────────────────────────────
+    if ts[0] > session_start_ms + _GAP_TOLERANCE_MS:
+        gap_end = _ms_to_ist(ts[0] - _CANDLE_INTERVAL_MS)
+        if session_start <= gap_end:
+            gaps.append((session_start, gap_end))
+
+    # ── middle gaps ───────────────────────────────────────────────────────
+    for i in range(len(ts) - 1):
+        diff = ts[i + 1] - ts[i]
+        if diff > _CANDLE_INTERVAL_MS + _GAP_TOLERANCE_MS:
+            gap_start = _ms_to_ist(ts[i]     + _CANDLE_INTERVAL_MS)
+            gap_end   = _ms_to_ist(ts[i + 1] - _CANDLE_INTERVAL_MS)
+            if gap_start <= gap_end:
+                gaps.append((gap_start, gap_end))
+
+    # ── trailing edge ─────────────────────────────────────────────────────
+    if ts[-1] < session_end_ms - _GAP_TOLERANCE_MS:
+        gap_start = _ms_to_ist(ts[-1] + _CANDLE_INTERVAL_MS)
+        if gap_start <= session_end:
+            gaps.append((gap_start, session_end))
+
+    return gaps
 
 
 def _find_symbol_gaps(
@@ -177,48 +240,69 @@ def _find_symbol_gaps(
     now: datetime,
 ) -> List[HistoryWindow]:
     """
-    Return list of (start, end) windows that are missing for this symbol.
+    Return every (start, end) window missing for this symbol using a
+    second-level gap scan — walks actual stored timestamps so partial
+    coverage within a day is detected and filled precisely.
 
-    Past days   — checked against live SQLite.  Missing day → full session.
-    Today       — gap start comes from pre_startup_ts (captured before live
-                  ticks arrived) so we never mistake fresh live ticks for
-                  pre-existing data.
+    Past days   — full session scanned second-by-second for holes.
+    Today       — scanned from session open to latest_completed_candle
+                  so every intra-day hole from mid-session restarts is found.
     """
     table = f"quote_{_safe_symbol(symbol)}"
     gaps: List[HistoryWindow] = []
 
     for day in required_days:
+        if not is_trading_day(day):
+            continue
 
         if day == now.date():
             # ── today ─────────────────────────────────────────────────────
-            if not is_trading_day(now):
+            if now.time() < MARKET_OPEN:
+                continue   # market not open yet — nothing to backfill
+
+            session_end = _latest_completed_candle(now)
+            if session_end is None:
                 continue
 
-            if pre_startup_ts is not None and pre_startup_ts.date() == day:
-                # restarted mid-session today — gap from last tick to now
-                gap_start = _floor_minute(pre_startup_ts) + timedelta(minutes=1)
-            elif now.time() >= MARKET_OPEN:
-                # first startup today OR pre_startup_ts is from a previous day
-                # in both cases fetch from today's session open
-                gap_start = _session_open(day)
-            else:
-                continue                # market not open yet
+            session_start = _session_open(day)
+            timestamps    = _get_timestamps_for_day(db_paths, table, day)
+            day_gaps      = _second_level_gaps(timestamps, session_start, session_end)
 
-            gap_end = _latest_completed_candle(now)
-            if gap_end and gap_start <= gap_end:
-                gaps.append((gap_start, gap_end))
+            for g in day_gaps:
+                print(
+                    f"[BACKFILL] {symbol} {day} TODAY gap: "
+                    f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
+                    flush=True,
+                )
+            gaps.extend(day_gaps)
 
         else:
             # ── past day ──────────────────────────────────────────────────
-            if not is_trading_day(day):
-                continue
-            if not _has_data_for_day(db_paths, table, day):
-                gaps.append((_session_open(day), _session_last_candle(day)))
-            else:
+            session_start = _session_open(day)
+            session_end   = _session_last_candle(day)
+            timestamps    = _get_timestamps_for_day(db_paths, table, day)
+
+            if not timestamps:
                 print(
-                    f"[BACKFILL] {symbol} {day} — data present, skipping",
+                    f"[BACKFILL] {symbol} {day} — no data, fetching full session",
                     flush=True,
                 )
+                gaps.append((session_start, session_end))
+            else:
+                day_gaps = _second_level_gaps(timestamps, session_start, session_end)
+                if day_gaps:
+                    for g in day_gaps:
+                        print(
+                            f"[BACKFILL] {symbol} {day} gap: "
+                            f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
+                            flush=True,
+                        )
+                    gaps.extend(day_gaps)
+                else:
+                    print(
+                        f"[BACKFILL] {symbol} {day} — data complete, skipping",
+                        flush=True,
+                    )
 
     return gaps
 
@@ -406,7 +490,7 @@ class BackfillManager:
             os.getenv("PG_HDBNAME", "market_history").strip() or "market_history"
         )
         self.min_days           = max(
-            1, int(os.getenv("X9_BACKFILL_MIN_DAYS", "3").strip() or "3")
+            3, int(os.getenv("X9_BACKFILL_MIN_DAYS", "3").strip() or "3")
         )
         self.flush_batch_size   = flush_batch_size
         self.flush_interval_sec = flush_interval_sec
@@ -490,6 +574,7 @@ class BackfillManager:
             dbname=self.history_dbname,
             flush_batch_size=self.flush_batch_size,
             flush_interval_sec=self.flush_interval_sec,
+            dedup_on_timestamp=True,
         )
 
         # ── fetch and enqueue ─────────────────────────────────────────────
@@ -535,6 +620,7 @@ class BackfillManager:
             "interval":   self.interval,
             "start_date": window_start.strftime("%Y-%m-%d"),
             "end_date":   window_end.strftime("%Y-%m-%d"),
+            "source":     "api",
         }
         data         = json.dumps(body).encode("utf-8")
         http_request = request.Request(
