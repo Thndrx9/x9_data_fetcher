@@ -349,10 +349,13 @@ def _ensure_table(
     prefix: str,
     sym: str,
     known_tables: Set[str],
+    dedup: bool = False,
 ) -> str:
     """
     Create depth_SYMBOL or quote_SYMBOL on first tick for that symbol.
     Matches SQLite schema: timestamp BIGINT | ingest_ns BIGINT | raw_json JSONB.
+    When dedup=True (history tables) adds UNIQUE(timestamp) so duplicate
+    backfill runs are safe via ON CONFLICT DO NOTHING.
     """
     table = f"{prefix}_{_safe_symbol(sym)}"
     if table in known_tables:
@@ -369,6 +372,11 @@ def _ensure_table(
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (timestamp)"
     )
+    if dedup:
+        cur.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS uidx_{table}_ts "
+            f"ON {table} (timestamp)"
+        )
     conn.commit()
     known_tables.add(table)
     print(f"[PG_{prefix.upper()}] new table: {table}", flush=True)
@@ -394,9 +402,10 @@ def _load_existing_tables(
     return tables
 
 
-@lru_cache(maxsize=256)
-def _insert_sql(table: str) -> str:
-    return f"INSERT INTO {table} (timestamp, ingest_ns, raw_json) VALUES %s"
+@lru_cache(maxsize=512)
+def _insert_sql(table: str, dedup: bool = False) -> str:
+    base = f"INSERT INTO {table} (timestamp, ingest_ns, raw_json) VALUES %s"
+    return base + " ON CONFLICT (timestamp) DO NOTHING" if dedup else base
 
 
 def _parse(row: dict) -> tuple:
@@ -440,12 +449,14 @@ class PgWriter:
         dbname: Optional[str] = None,
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
+        dedup_on_timestamp: bool = False,
     ):
         if table not in ("depth", "quote"):
             raise ValueError("table must be 'depth' or 'quote'")
 
         self.table  = table
         self._tag   = f"[PG_{table.upper()}]"
+        self._dedup = dedup_on_timestamp
         self.flush_batch_size   = max(1,   int(flush_batch_size))
         self.flush_interval_sec = max(0.2, float(flush_interval_sec))
 
@@ -539,13 +550,13 @@ class PgWriter:
                 continue
 
             try:
-                table = _ensure_table(conn, self.table, sym, known_tables)
+                table = _ensure_table(conn, self.table, sym, known_tables, self._dedup)
             except Exception as exc:
                 print(f"{self._tag}[ERROR] ensure table failed for {sym}: {exc}", flush=True)
                 buffered[sym] = []
                 continue
 
-            sql    = _insert_sql(table)
+            sql    = _insert_sql(table, self._dedup)
             parsed: List[tuple] = []
 
             for row in rows:
