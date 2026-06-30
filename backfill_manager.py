@@ -775,12 +775,29 @@ class BackfillManager:
                 print(
                     f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol}: {exc}",
                     flush=True,
-                )
+                    )
                 return []
 
-            for row in _extract_candle_rows(payload):
+            rows = _extract_candle_rows(payload)
+            if not rows:
+                if attempt < max_attempts:
+                    print(
+                        f"[BACKFILL][WARN] API returned 0 rows for {exchange}:{symbol} "
+                        f"{window_start.strftime('%Y-%m-%d')} "
+                        f"(attempt {attempt}/{max_attempts}); retrying in 1s",
+                        flush=True,
+                    )
+                    time.sleep(1)
+                    continue
+                break
+
+            parsed_timestamps: List[int] = []
+            for row in rows:
                 ts_ms = _row_timestamp(row)
-                if ts_ms is None or ts_ms < start_ms or ts_ms > end_ms:
+                if ts_ms is None:
+                    continue
+                parsed_timestamps.append(ts_ms)
+                if ts_ms < start_ms or ts_ms > end_ms:
                     continue
                 normalized = _normalize_candle(row, symbol, exchange, self.interval)
                 if normalized:
@@ -789,18 +806,40 @@ class BackfillManager:
             if candles:
                 return candles
 
-            if attempt < max_attempts:
+            if parsed_timestamps:
+                first = _ms_to_ist(min(parsed_timestamps))
+                last = _ms_to_ist(max(parsed_timestamps))
+                first_utc = datetime.fromtimestamp(
+                    min(parsed_timestamps) / 1000,
+                    tz=timezone.utc,
+                )
+                last_utc = datetime.fromtimestamp(
+                    max(parsed_timestamps) / 1000,
+                    tz=timezone.utc,
+                )
                 print(
-                    f"[BACKFILL][WARN] 0 candles from API for {exchange}:{symbol} "
-                    f"{window_start.strftime('%Y-%m-%d')} "
-                    f"(attempt {attempt}/{max_attempts}); retrying in 1s",
+                    f"[BACKFILL][WARN] API returned {len(rows)} row(s) for "
+                    f"{exchange}:{symbol}, but 0 matched gap "
+                    f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
+                    f"{window_end.strftime('%H:%M')} IST; response timestamp range "
+                    f"{first.strftime('%Y-%m-%d %H:%M')}→"
+                    f"{last.strftime('%H:%M')} IST "
+                    f"({first_utc.strftime('%Y-%m-%d %H:%M')}→"
+                    f"{last_utc.strftime('%H:%M')} UTC)",
                     flush=True,
                 )
-                time.sleep(1)
+                return []
+
+            print(
+                f"[BACKFILL][WARN] API returned {len(rows)} row(s) for "
+                f"{exchange}:{symbol}, but none had a readable timestamp",
+                flush=True,
+            )
+            return []
 
         preview = last_response[:300] if len(last_response) > 300 else last_response
         print(
-            f"[BACKFILL][WARN] 0 candles from API for {exchange}:{symbol} "
+            f"[BACKFILL][WARN] API returned 0 rows for {exchange}:{symbol} "
             f"{window_start.strftime('%Y-%m-%d')} after {max_attempts} attempts "
             f"— response: {preview}",
             flush=True,
