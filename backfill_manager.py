@@ -14,6 +14,7 @@ import psycopg2
 from x9_data_fetcher.market_time import (
     MARKET_CLOSE,
     MARKET_OPEN,
+    is_market_open,
     is_trading_day,
     now_kolkata,
     tz_kolkata,
@@ -734,18 +735,31 @@ class BackfillManager:
         window_start: datetime,
         window_end: datetime,
     ) -> List[dict]:
+        now = now_kolkata()
+
+        # When fetching today's data during market hours the OpenAlgo history
+        # API requires end_date = tomorrow to return the live/partial session.
+        # For past dates end_date == the date itself is correct.
+        if window_start.date() == now.date() and is_market_open(now):
+            from datetime import timedelta as _td
+            api_end_date = (window_end.date() + _td(days=1)).strftime("%Y-%m-%d")
+        else:
+            api_end_date = window_end.strftime("%Y-%m-%d")
+
         body = {
             "apikey":     self.api_key,
             "symbol":     symbol,
             "exchange":   exchange,
             "interval":   self.interval,
             "start_date": window_start.strftime("%Y-%m-%d"),
-            "end_date":   window_end.strftime("%Y-%m-%d"),
+            "end_date":   api_end_date,
             "source":     "api",
         }
-        data         = json.dumps(body).encode("utf-8")
+        data     = json.dumps(body).encode("utf-8")
         start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
         end_ms   = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
+        # Tolerate APIs that stamp the candle close time instead of open time
+        end_ms_tolerant = end_ms + _CANDLE_INTERVAL_MS
         max_attempts = 3
         last_response = ""
 
@@ -775,7 +789,7 @@ class BackfillManager:
                 print(
                     f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol}: {exc}",
                     flush=True,
-                    )
+                )
                 return []
 
             rows = _extract_candle_rows(payload)
@@ -797,7 +811,7 @@ class BackfillManager:
                 if ts_ms is None:
                     continue
                 parsed_timestamps.append(ts_ms)
-                if ts_ms < start_ms or ts_ms > end_ms:
+                if ts_ms < start_ms or ts_ms > end_ms_tolerant:
                     continue
                 normalized = _normalize_candle(row, symbol, exchange, self.interval)
                 if normalized:
@@ -807,25 +821,20 @@ class BackfillManager:
                 return candles
 
             if parsed_timestamps:
-                first = _ms_to_ist(min(parsed_timestamps))
-                last = _ms_to_ist(max(parsed_timestamps))
-                first_utc = datetime.fromtimestamp(
-                    min(parsed_timestamps) / 1000,
-                    tz=timezone.utc,
-                )
-                last_utc = datetime.fromtimestamp(
-                    max(parsed_timestamps) / 1000,
-                    tz=timezone.utc,
-                )
+                first     = _ms_to_ist(min(parsed_timestamps))
+                last      = _ms_to_ist(max(parsed_timestamps))
+                first_utc = datetime.fromtimestamp(min(parsed_timestamps) / 1000, tz=timezone.utc)
+                last_utc  = datetime.fromtimestamp(max(parsed_timestamps) / 1000, tz=timezone.utc)
                 print(
-                    f"[BACKFILL][WARN] API returned {len(rows)} row(s) for "
-                    f"{exchange}:{symbol}, but 0 matched gap "
+                    f"[BACKFILL][WARN] {exchange}:{symbol} API returned {len(rows)} "
+                    f"row(s) but none matched gap "
                     f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
-                    f"{window_end.strftime('%H:%M')} IST; response timestamp range "
-                    f"{first.strftime('%Y-%m-%d %H:%M')}→"
-                    f"{last.strftime('%H:%M')} IST "
+                    f"{window_end.strftime('%H:%M')} IST. "
+                    f"Response range: "
+                    f"{first.strftime('%Y-%m-%d %H:%M')}→{last.strftime('%H:%M')} IST "
                     f"({first_utc.strftime('%Y-%m-%d %H:%M')}→"
-                    f"{last_utc.strftime('%H:%M')} UTC)",
+                    f"{last_utc.strftime('%H:%M')} UTC). "
+                    f"Broker may not have captured this period.",
                     flush=True,
                 )
                 return []
@@ -844,5 +853,4 @@ class BackfillManager:
             f"— response: {preview}",
             flush=True,
         )
-
         return []
