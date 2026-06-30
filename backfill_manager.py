@@ -9,6 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib import request
 from urllib.error import URLError
 
+import psycopg2
+
 from x9_data_fetcher.market_time import (
     MARKET_CLOSE,
     MARKET_OPEN,
@@ -16,7 +18,7 @@ from x9_data_fetcher.market_time import (
     now_kolkata,
     tz_kolkata,
 )
-from x9_data_fetcher.pg_writer import PgWriter
+from x9_data_fetcher.pg_writer import PgWriter, _conn_params
 
 
 HistoryWindow = Tuple[datetime, datetime]
@@ -382,6 +384,94 @@ def latest_collected_timestamp(quote_output_dir: str) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
+# Historical PostgreSQL helpers
+# ---------------------------------------------------------------------------
+
+def _history_connection(dbname: str):
+    conn = psycopg2.connect(**_conn_params(dbname))
+    conn.autocommit = True
+    return conn
+
+
+def _history_table_exists(conn, table: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s",
+        (table.lower(),),
+    )
+    return cur.fetchone() is not None
+
+
+def _history_timestamps_for_window(
+    conn,
+    table: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> List[int]:
+    if not _history_table_exists(conn, table):
+        return []
+
+    start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
+    end_ms = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
+
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT timestamp FROM {table} WHERE timestamp >= %s AND timestamp <= %s",
+        (start_ms, end_ms),
+    )
+    timestamps: List[int] = []
+    for (raw_ts,) in cur.fetchall():
+        ts_ms = _to_ms(raw_ts)
+        if ts_ms is not None:
+            timestamps.append(ts_ms)
+    return sorted(set(timestamps))
+
+
+def _filter_gaps_already_in_history(
+    conn,
+    symbol: str,
+    exchange: str,
+    gaps: List[HistoryWindow],
+) -> List[HistoryWindow]:
+    table = f"quote_{_safe_symbol(symbol)}".lower()
+    remaining: List[HistoryWindow] = []
+
+    for window_start, window_end in gaps:
+        timestamps = _history_timestamps_for_window(
+            conn,
+            table,
+            window_start,
+            window_end,
+        )
+        if not timestamps:
+            remaining.append((window_start, window_end))
+            continue
+
+        missing_windows = _second_level_gaps(timestamps, window_start, window_end)
+        if not missing_windows:
+            print(
+                f"[BACKFILL] {exchange}:{symbol} "
+                f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
+                f"{window_end.strftime('%H:%M')} "
+                "already present in history DB, skipping",
+                flush=True,
+            )
+            continue
+
+        if missing_windows != [(window_start, window_end)]:
+            print(
+                f"[BACKFILL] {exchange}:{symbol} "
+                f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
+                f"{window_end.strftime('%H:%M')} "
+                f"partially present in history DB, fetching {len(missing_windows)} gap(s)",
+                flush=True,
+            )
+        remaining.extend(missing_windows)
+
+    return remaining
+
+
+# ---------------------------------------------------------------------------
 # OpenAlgo history API helpers
 # ---------------------------------------------------------------------------
 
@@ -541,21 +631,52 @@ class BackfillManager:
 
         # ── per-symbol gap detection ──────────────────────────────────────
         all_gaps: Dict[str, Tuple[str, List[HistoryWindow]]] = {}
+        history_conn = None
 
-        for symbol_row in self.symbols:
-            symbol   = str(symbol_row["symbol"]).upper()
-            exchange = str(symbol_row.get("exchange") or "NSE").upper()
-
-            gaps = _find_symbol_gaps(
-                db_paths,
-                symbol,
-                required_days,
-                self._last_known_timestamp,
-                now,
+        try:
+            history_conn = _history_connection(self.history_dbname)
+        except Exception as exc:
+            print(
+                f"[BACKFILL][WARN] history DB check unavailable: {exc}",
+                flush=True,
             )
 
-            if gaps:
-                all_gaps[symbol] = (exchange, gaps)
+        try:
+            for symbol_row in self.symbols:
+                symbol   = str(symbol_row["symbol"]).upper()
+                exchange = str(symbol_row.get("exchange") or "NSE").upper()
+
+                gaps = _find_symbol_gaps(
+                    db_paths,
+                    symbol,
+                    required_days,
+                    self._last_known_timestamp,
+                    now,
+                )
+
+                if gaps and history_conn is not None:
+                    try:
+                        gaps = _filter_gaps_already_in_history(
+                            history_conn,
+                            symbol,
+                            exchange,
+                            gaps,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[BACKFILL][WARN] history DB check failed for "
+                            f"{exchange}:{symbol}: {exc}",
+                            flush=True,
+                        )
+
+                if gaps:
+                    all_gaps[symbol] = (exchange, gaps)
+        finally:
+            if history_conn is not None:
+                try:
+                    history_conn.close()
+                except Exception:
+                    pass
 
         if not all_gaps:
             print("[BACKFILL] no missing data detected — nothing to fetch", flush=True)
