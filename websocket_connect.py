@@ -109,6 +109,11 @@ async def websocket_client(
                     hb_task.cancel()
                     await asyncio.gather(hb_task, return_exceptions=True)
         except asyncio.CancelledError:
+            if conn_log_dir:
+                connection_log.log_event(
+                    conn_log_dir, "DISCONNECTED", now_kolkata(),
+                    mode=mode_label, note="task cancelled (shutdown/session end)",
+                )
             raise
         except Exception as exc:
             if conn_log_dir:
