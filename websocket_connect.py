@@ -1,10 +1,12 @@
 import asyncio
 import json
-from typing import List
+from typing import List, Optional
 
 import websockets
 
+from x9_data_fetcher import connection_log
 from x9_data_fetcher.event_bus import market_data_queue
+from x9_data_fetcher.market_time import now_kolkata
 
 DEFAULT_WS_URL = "ws://127.0.0.1:8765"
 
@@ -15,12 +17,17 @@ async def websocket_client(
     instruments: List[dict],
     mode: str,
     depth_levels: int = 5,
+    conn_log_dir: Optional[str] = None,
 ):
     """
     WebSocket connection only:
     - authenticate
     - subscribe one mode per connection
     - forward incoming market_data packets to event_bus queue
+
+    conn_log_dir: if set, DAY_STARTED / RECONNECTED / DISCONNECTED events are
+    written to the connection log for this connection. Pass this only for
+    the "Quote" mode connection — that's the one BackfillManager cares about.
     """
     if not ws_url:
         ws_url = DEFAULT_WS_URL
@@ -36,6 +43,15 @@ async def websocket_client(
             async with websockets.connect(ws_url) as ws:
                 await ws.send(json.dumps({"action": "authenticate", "api_key": api_key}))
                 print(f"[WS] Authentication sent | mode={mode_label}", flush=True)
+
+                if conn_log_dir:
+                    now = now_kolkata()
+                    event = (
+                        "RECONNECTED"
+                        if connection_log.has_event_today(conn_log_dir, "DAY_STARTED", now)
+                        else "DAY_STARTED"
+                    )
+                    connection_log.log_event(conn_log_dir, event, now, mode=mode_label)
 
                 for inst in instruments:
                     payload = {
@@ -95,5 +111,10 @@ async def websocket_client(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if conn_log_dir:
+                connection_log.log_event(
+                    conn_log_dir, "DISCONNECTED", now_kolkata(),
+                    mode=mode_label, note=str(exc),
+                )
             print(f"[WS][ERROR] mode={mode_label} {exc}. Reconnecting in 2s...", flush=True)
             await asyncio.sleep(2)
