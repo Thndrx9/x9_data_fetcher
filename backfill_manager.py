@@ -278,12 +278,22 @@ def _day_windows_from_log(
     # prior connection today) — everything from open to that first
     # connection is missing and was never recorded as a DISCONNECTED event
     # because there was no earlier connection to disconnect from.
+    #
+    # Boundaries are snapped to full MINUTE boundaries, not exact seconds.
+    # Candles are stamped by their OPEN time (e.g. the 11:45 candle is
+    # timestamped 11:45:00). If a disconnect/reconnect happens mid-minute
+    # and the window used the exact second, the fetch filter would exclude
+    # that candle entirely (its 11:45:00 stamp falls before an 11:45:50
+    # window start) — silently losing a partially-affected candle. Snapping
+    # to the minute containing the event ensures any touched candle is
+    # always re-fetched in full from the authoritative history API.
     first_event, first_ts_ms, _first_mode = events[0]
     if first_event == "DAY_STARTED":
-        first_dt = _ms_to_ist(first_ts_ms)
-        if first_dt > session_start + timedelta(milliseconds=_GAP_TOLERANCE_MS):
+        first_dt          = _ms_to_ist(first_ts_ms)
+        first_minute      = _floor_minute(first_dt)
+        if first_minute > session_start:
             gap_start = session_start
-            gap_end   = min(first_dt - timedelta(milliseconds=_CANDLE_INTERVAL_MS), session_end)
+            gap_end   = min(first_minute, session_end)
             if gap_start <= gap_end:
                 windows.append((gap_start, gap_end))
 
@@ -293,8 +303,8 @@ def _day_windows_from_log(
                 pending_disconnect_ms = ts_ms
         elif event in ("DAY_STARTED", "RECONNECTED"):
             if pending_disconnect_ms is not None:
-                gap_start = _ms_to_ist(pending_disconnect_ms)
-                gap_end   = _ms_to_ist(ts_ms - _CANDLE_INTERVAL_MS)
+                gap_start = _floor_minute(_ms_to_ist(pending_disconnect_ms))
+                gap_end   = _floor_minute(_ms_to_ist(ts_ms))
                 gap_start = max(gap_start, session_start)
                 gap_end   = min(gap_end, session_end)
                 if gap_start <= gap_end:
@@ -303,7 +313,7 @@ def _day_windows_from_log(
 
     # trailing disconnect never followed by a reconnect in the log
     if pending_disconnect_ms is not None:
-        gap_start = max(_ms_to_ist(pending_disconnect_ms), session_start)
+        gap_start = max(_floor_minute(_ms_to_ist(pending_disconnect_ms)), session_start)
         gap_end   = session_end if day != now.date() else (_latest_completed_candle(now) or session_end)
         if gap_start <= gap_end:
             windows.append((gap_start, gap_end))
