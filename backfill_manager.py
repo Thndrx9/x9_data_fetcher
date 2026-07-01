@@ -11,6 +11,7 @@ from urllib.error import URLError
 
 import psycopg2
 
+from x9_data_fetcher import connection_log
 from x9_data_fetcher.market_time import (
     MARKET_CLOSE,
     MARKET_OPEN,
@@ -235,77 +236,158 @@ def _second_level_gaps(
     return gaps
 
 
+def _day_windows_from_log(
+    quote_output_dir: str,
+    day: date,
+    session_start: datetime,
+    session_end: datetime,
+    now: datetime,
+) -> Optional[List[HistoryWindow]]:
+    """
+    Derive gap windows for `day` purely from the connection log — no SQLite
+    scanning needed.  These windows are system-wide (the feed was down for
+    every symbol), so they're computed once per day and reused for every
+    symbol needing backfill.
+
+    Returns:
+        None        — no log data for this day at all → caller must fall
+                       back to the per-symbol timestamp scan (old behaviour)
+        []          — log shows a clean day (connected, no disconnects)
+        [(s, e), …] — exact outage windows derived from DISCONNECTED/
+                       RECONNECTED pairs, or the full session if
+                       DAY_NOT_STARTED was recorded
+    """
+    events = connection_log.get_events_for_day(quote_output_dir, day)
+    if not events:
+        return None   # no log info — fall back to data scan
+
+    if any(e[0] == "DAY_NOT_STARTED" for e in events):
+        return [(session_start, session_end)]
+
+    if not any(e[0] in ("DAY_STARTED", "RECONNECTED") for e in events):
+        # log has rows but none indicate a successful connection — ambiguous,
+        # safer to fall back to a real data scan
+        return None
+
+    windows: List[HistoryWindow] = []
+    pending_disconnect_ms: Optional[int] = None
+
+    for event, ts_ms, _mode in events:
+        if event == "DISCONNECTED":
+            if pending_disconnect_ms is None:
+                pending_disconnect_ms = ts_ms
+        elif event in ("DAY_STARTED", "RECONNECTED"):
+            if pending_disconnect_ms is not None:
+                gap_start = _ms_to_ist(pending_disconnect_ms)
+                gap_end   = _ms_to_ist(ts_ms - _CANDLE_INTERVAL_MS)
+                gap_start = max(gap_start, session_start)
+                gap_end   = min(gap_end, session_end)
+                if gap_start <= gap_end:
+                    windows.append((gap_start, gap_end))
+                pending_disconnect_ms = None
+
+    # trailing disconnect never followed by a reconnect in the log
+    if pending_disconnect_ms is not None:
+        gap_start = max(_ms_to_ist(pending_disconnect_ms), session_start)
+        gap_end   = session_end if day != now.date() else (_latest_completed_candle(now) or session_end)
+        if gap_start <= gap_end:
+            windows.append((gap_start, gap_end))
+
+    return windows
+
+
 def _find_symbol_gaps(
     db_paths: List[Path],
     symbol: str,
     required_days: List[date],
     pre_startup_ts: Optional[datetime],
     now: datetime,
+    quote_output_dir: Optional[str] = None,
+    log_windows_cache: Optional[Dict[date, Optional[List[HistoryWindow]]]] = None,
 ) -> List[HistoryWindow]:
     """
-    Return every (start, end) window missing for this symbol using a
-    second-level gap scan — walks actual stored timestamps so partial
-    coverage within a day is detected and filled precisely.
+    Return every (start, end) window missing for this symbol.
 
-    Past days   — full session scanned second-by-second for holes.
-    Today       — scanned from session open to latest_completed_candle
-                  so every intra-day hole from mid-session restarts is found.
+    Primary source — the connection log (DAY_STARTED / DISCONNECTED /
+    RECONNECTED / DAY_NOT_STARTED).  If the log has data for a day, its
+    windows are used directly and NO SQLite scan happens for that day —
+    clean days cost nothing, known outages are queued straight to fetch.
+
+    Fallback — for any day with no log data at all (log wasn't running,
+    or predates this feature), fall back to the second-level timestamp
+    scan of this symbol's own SQLite data, same as before.
+
+    `log_windows_cache` lets the caller compute each day's log windows once
+    and reuse them across all symbols, since log-derived windows are
+    system-wide (identical for every symbol on that day).
     """
     table = f"quote_{_safe_symbol(symbol)}"
     gaps: List[HistoryWindow] = []
+    if log_windows_cache is None:
+        log_windows_cache = {}
 
     for day in required_days:
         if not is_trading_day(day):
             continue
 
-        if day == now.date():
-            # ── today ─────────────────────────────────────────────────────
-            if now.time() < MARKET_OPEN:
-                continue   # market not open yet — nothing to backfill
+        is_today = day == now.date()
 
+        if is_today:
+            if now.time() < MARKET_OPEN:
+                continue
             session_end = _latest_completed_candle(now)
             if session_end is None:
                 continue
-
             session_start = _session_open(day)
-            timestamps    = _get_timestamps_for_day(db_paths, table, day)
-            day_gaps      = _second_level_gaps(timestamps, session_start, session_end)
+        else:
+            session_start = _session_open(day)
+            session_end   = _session_last_candle(day)
 
+        # ── try the connection log first (cached per day across symbols) ──
+        if day not in log_windows_cache:
+            log_windows_cache[day] = (
+                _day_windows_from_log(quote_output_dir, day, session_start, session_end, now)
+                if quote_output_dir else None
+            )
+        log_windows = log_windows_cache[day]
+
+        if log_windows is not None:
+            if log_windows:
+                for g in log_windows:
+                    print(
+                        f"[BACKFILL] {symbol} {day} LOG gap: "
+                        f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
+                        flush=True,
+                    )
+                gaps.extend(log_windows)
+            # else: log confirms a clean day — nothing to do, no scan needed
+            continue
+
+        # ── no log data for this day — fall back to the data scan ────────
+        timestamps = _get_timestamps_for_day(db_paths, table, day)
+
+        if not timestamps:
+            print(
+                f"[BACKFILL] {symbol} {day} — no data/log, fetching full session",
+                flush=True,
+            )
+            gaps.append((session_start, session_end))
+            continue
+
+        day_gaps = _second_level_gaps(timestamps, session_start, session_end)
+        if day_gaps:
             for g in day_gaps:
                 print(
-                    f"[BACKFILL] {symbol} {day} TODAY gap: "
+                    f"[BACKFILL] {symbol} {day} SCAN gap: "
                     f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
                     flush=True,
                 )
             gaps.extend(day_gaps)
-
         else:
-            # ── past day ──────────────────────────────────────────────────
-            session_start = _session_open(day)
-            session_end   = _session_last_candle(day)
-            timestamps    = _get_timestamps_for_day(db_paths, table, day)
-
-            if not timestamps:
-                print(
-                    f"[BACKFILL] {symbol} {day} — no data, fetching full session",
-                    flush=True,
-                )
-                gaps.append((session_start, session_end))
-            else:
-                day_gaps = _second_level_gaps(timestamps, session_start, session_end)
-                if day_gaps:
-                    for g in day_gaps:
-                        print(
-                            f"[BACKFILL] {symbol} {day} gap: "
-                            f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
-                            flush=True,
-                        )
-                    gaps.extend(day_gaps)
-                else:
-                    print(
-                        f"[BACKFILL] {symbol} {day} — data complete, skipping",
-                        flush=True,
-                    )
+            print(
+                f"[BACKFILL] {symbol} {day} — data complete, skipping",
+                flush=True,
+            )
 
     return gaps
 
@@ -633,6 +715,9 @@ class BackfillManager:
         # ── per-symbol gap detection ──────────────────────────────────────
         all_gaps: Dict[str, Tuple[str, List[HistoryWindow]]] = {}
         history_conn = None
+        # computed once per day, shared across all symbols — log-derived
+        # windows are system-wide (same outage applies to every symbol)
+        log_windows_cache: Dict[date, Optional[List[HistoryWindow]]] = {}
 
         try:
             history_conn = _history_connection(self.history_dbname)
@@ -653,6 +738,8 @@ class BackfillManager:
                     required_days,
                     self._last_known_timestamp,
                     now,
+                    quote_output_dir=self.quote_output_dir,
+                    log_windows_cache=log_windows_cache,
                 )
 
                 if gaps and history_conn is not None:

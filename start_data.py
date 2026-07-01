@@ -15,7 +15,12 @@ from x9_data_fetcher.venv_setup import create_and_activate_venv
 
 create_and_activate_venv()
 
-from x9_data_fetcher.backfill_manager import BackfillManager, latest_collected_timestamp
+from x9_data_fetcher.backfill_manager import (
+    BackfillManager,
+    latest_collected_timestamp,
+    _previous_trading_day,
+)
+from x9_data_fetcher import connection_log
 from x9_data_fetcher.data_fetcher import MarketDataFetcher
 from x9_data_fetcher.event_bus import market_data_queue
 from x9_data_fetcher.market_time import (
@@ -74,6 +79,17 @@ async def run_engine():
 
     # Refresh trading calendar from NSE if stale (>7 days) or has no future holidays
     refresh_trading_calendar()
+
+    # ── Connection log watchdog — if the previous trading day has zero
+    #    connection events (process crashed before ever connecting, or the
+    #    whole day was missed), mark it DAY_NOT_STARTED so BackfillManager
+    #    treats it as a full-session gap instead of guessing via data scan ──
+    _startup_now = now_kolkata()
+    _prev_trading_day = _previous_trading_day(_startup_now.date())
+    if _prev_trading_day is not None:
+        connection_log.mark_day_not_started_if_missing(
+            quote_output_dir, _prev_trading_day, _startup_now
+        )
 
     # run PG setup at startup so PostgreSQL is ready before market opens
     # skips instantly if already running, installs+configures if missing
@@ -146,6 +162,11 @@ async def run_engine():
         if close_secs <= 0:
             continue  # Edge case: woke up exactly at 15:30
 
+        # Re-check watchdog each session start (process may run for weeks)
+        _prev_day = _previous_trading_day(now.date())
+        if _prev_day is not None:
+            connection_log.mark_day_not_started_if_missing(quote_output_dir, _prev_day, now)
+
         _drain_queue()
 
         # capture BEFORE websocket starts writing live ticks
@@ -175,7 +196,10 @@ async def run_engine():
 
         tasks = [
             asyncio.create_task(
-                websocket_client(ws_url, api_key, instruments, mode="Quote")
+                websocket_client(
+                    ws_url, api_key, instruments, mode="Quote",
+                    conn_log_dir=quote_output_dir,
+                )
             ),
             asyncio.create_task(
                 websocket_client(
