@@ -272,6 +272,21 @@ def _day_windows_from_log(
     windows: List[HistoryWindow] = []
     pending_disconnect_ms: Optional[int] = None
 
+    # ── leading edge ─────────────────────────────────────────────────────
+    # If the very first event is DAY_STARTED and it happens after session
+    # open, the system started mid-session (or restarted fresh with no
+    # prior connection today) — everything from open to that first
+    # connection is missing and was never recorded as a DISCONNECTED event
+    # because there was no earlier connection to disconnect from.
+    first_event, first_ts_ms, _first_mode = events[0]
+    if first_event == "DAY_STARTED":
+        first_dt = _ms_to_ist(first_ts_ms)
+        if first_dt > session_start + timedelta(milliseconds=_GAP_TOLERANCE_MS):
+            gap_start = session_start
+            gap_end   = min(first_dt - timedelta(milliseconds=_CANDLE_INTERVAL_MS), session_end)
+            if gap_start <= gap_end:
+                windows.append((gap_start, gap_end))
+
     for event, ts_ms, _mode in events:
         if event == "DISCONNECTED":
             if pending_disconnect_ms is None:
