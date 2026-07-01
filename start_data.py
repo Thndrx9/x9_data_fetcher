@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import os
 import signal
 import sys
@@ -33,6 +34,35 @@ from x9_data_fetcher.market_time import (
 from x9_data_fetcher.symbols import load_symbols
 from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup
 from x9_data_fetcher.websocket_connect import websocket_client
+
+
+_LOCK_FILE_PATH = os.getenv("X9_FETCHER_LOCK_FILE", "/tmp/x9_data_fetcher.lock")
+_lock_file_handle = None  # kept open for process lifetime — closing releases the lock
+
+
+def _acquire_singleton_lock() -> bool:
+    """
+    Ensure only one instance of this script runs at a time.
+
+    Uses fcntl.flock on a lock file — unlike a PID file, the OS
+    automatically releases this lock if the process dies or crashes,
+    so it can never get stuck permanently locked.
+
+    Returns True if the lock was acquired (safe to proceed), False if
+    another instance already holds it.
+    """
+    global _lock_file_handle
+    try:
+        _lock_file_handle = open(_LOCK_FILE_PATH, "w")
+        fcntl.flock(_lock_file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file_handle.write(str(os.getpid()))
+        _lock_file_handle.flush()
+        return True
+    except BlockingIOError:
+        return False
+    except OSError as exc:
+        print(f"[X9_FETCHER][WARN] lock file check failed ({exc}) — proceeding anyway", flush=True)
+        return True
 
 
 def _drain_queue():
@@ -276,4 +306,13 @@ async def run_engine():
 
 
 if __name__ == "__main__":
+    if not _acquire_singleton_lock():
+        print(
+            f"[X9_FETCHER][FATAL] another instance is already running "
+            f"(lock file: {_LOCK_FILE_PATH}) — exiting to avoid duplicate "
+            f"processes, duplicate websocket connections, and duplicate "
+            f"backfill API calls",
+            flush=True,
+        )
+        sys.exit(1)
     asyncio.run(run_engine())
