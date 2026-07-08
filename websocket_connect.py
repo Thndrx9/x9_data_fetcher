@@ -48,6 +48,50 @@ async def websocket_client(
                 await ws.send(json.dumps({"action": "authenticate", "api_key": api_key}))
                 print(f"[WS] Authentication sent | mode={mode_label}", flush=True)
 
+                # ── A: don't trust "sent" — wait for the server's actual
+                # auth response before treating this connection as live.
+                # OpenAlgo's websocket proxy replies with either:
+                #   success: {"type": "auth", "status": "success", ...}
+                #   failure: {"status": "error", "code": "...", "message": "..."}
+                # Previously we logged DAY_STARTED/RECONNECTED right after
+                # sending the auth request, with no idea whether the server
+                # actually accepted it — a stale daily token could get
+                # rejected here while we'd already marked the day "connected".
+                try:
+                    raw_auth_reply = await asyncio.wait_for(ws.recv(), timeout=15)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"no auth response from server within 15s | mode={mode_label}"
+                    )
+
+                try:
+                    auth_reply = json.loads(raw_auth_reply)
+                except json.JSONDecodeError:
+                    raise RuntimeError(
+                        f"unparseable auth response | mode={mode_label} raw={raw_auth_reply!r}"
+                    )
+
+                if auth_reply.get("status") != "success":
+                    # ── B: an explicit auth error is a real disconnect, not
+                    # something to log and shrug off. Raising here routes us
+                    # into the existing except-Exception block below, which
+                    # logs DISCONNECTED and retries in 2s — so a bad/expired
+                    # daily token shows up as a visible reconnect loop
+                    # instead of a silently "successful" connection with zero
+                    # data flowing.
+                    err_code = auth_reply.get("code", "UNKNOWN")
+                    err_msg  = auth_reply.get("message", "authentication failed")
+                    raise RuntimeError(
+                        f"auth rejected by server | mode={mode_label} "
+                        f"code={err_code} message={err_msg}"
+                    )
+
+                print(
+                    f"[WS] Authenticated | mode={mode_label} "
+                    f"broker={auth_reply.get('broker')} user={auth_reply.get('user_id')}",
+                    flush=True,
+                )
+
                 if conn_log_dir:
                     now = now_kolkata()
                     event = (
@@ -111,7 +155,16 @@ async def websocket_client(
                             data["_subscription_mode"] = mode_label
                             await market_data_queue.put(data)
                         elif data.get("status") == "error":
-                            print(f"[WS][ERROR] mode={mode_label} {data}", flush=True)
+                            # ── B (ongoing stream): a mid-session error — e.g.
+                            # the broker session was invalidated after we'd
+                            # already authenticated — is a real fault. Raising
+                            # instead of just printing ensures it's logged as
+                            # DISCONNECTED and triggers a reconnect/re-auth,
+                            # rather than leaving a socket open that looks
+                            # "connected" while receiving nothing useful.
+                            raise RuntimeError(
+                                f"server error message | mode={mode_label} data={data}"
+                            )
                 finally:
                     hb_task.cancel()
                     await asyncio.gather(hb_task, return_exceptions=True)

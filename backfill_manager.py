@@ -32,22 +32,50 @@ _GAP_TOLERANCE_MS   = 90_000   # 90 s — absorbs minor tick-timing jitter
 _CANDLE_INTERVAL_MS = 60_000   # 1-minute candle width
 
 
-def _progress_write(text: str) -> None:
+_IS_TTY = sys.stdout.isatty()
+_NON_TTY_PROGRESS_INTERVAL = 20  # print a plain line every N updates when not a live terminal
+
+
+def _progress_write(text: str, *, index: Optional[int] = None, total: Optional[int] = None) -> None:
     """
-    Overwrite the current terminal line with new progress text (no newline).
-    Used for high-frequency per-symbol status so 180+ symbols don't scroll
-    the log — only the latest status is visible, and it clears itself when
-    a permanent (newline-terminated) message needs to be printed next.
-    "\\033[K" clears anything left over from a longer previous line.
+    Show live per-item progress without flooding the log.
+
+    On a real interactive terminal (sys.stdout.isatty()), this overwrites
+    the current line in place with "\\r" — clean, single line, no scrolling.
+
+    "\\r" only means "overwrite" to an actual terminal emulator. When stdout
+    is redirected — a log file, `nohup.out`, `docker logs`, systemd/
+    journald, or piped through `tee`/`ssh ... | somewhere` — nothing ever
+    interprets the "\\r", so every write just lands as more raw bytes with
+    no line break, which is exactly the smashed-together, concatenated line
+    you get if you cat/tail that file or paste it as plain text.
+
+    In that case (not a tty), fall back to a plain newline-terminated print,
+    but only periodically — every `_NON_TTY_PROGRESS_INTERVAL`-th update,
+    plus always the first and last — so a redirected log still shows
+    progress without one line per symbol for 180+ symbols.
+
+    `index`/`total` are only needed for the non-tty fallback; omit them if
+    you don't have a periodic count to give (the tty path ignores them).
     """
-    sys.stdout.write(f"\r{text}\033[K")
-    sys.stdout.flush()
+    if _IS_TTY:
+        sys.stdout.write(f"\r{text}\033[K")
+        sys.stdout.flush()
+        return
+
+    if index is None or total is None:
+        return
+
+    if index == 1 or index == total or index % _NON_TTY_PROGRESS_INTERVAL == 0:
+        print(text, flush=True)
 
 
 def _progress_done() -> None:
     """Finalize the current progress line so the next print starts fresh."""
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    if _IS_TTY:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    # non-tty: nothing to finalize — periodic plain lines already have newlines
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +229,53 @@ def _get_timestamps_for_day(
             print(f"[BACKFILL][WARN] error reading {db_path.name}: {exc}", flush=True)
 
     return sorted(set(timestamps))
+
+
+def _day_has_any_data(
+    db_paths: List[Path], day: date, session_start: datetime, session_end: datetime
+) -> bool:
+    """
+    C — belt-and-suspenders check for the log-based fast path.
+
+    The connection log only tracks socket-level connect/disconnect state.
+    If auth is silently rejected in a way that doesn't close the socket
+    (or a token expires mid-session without a clean disconnect), the log
+    can say "clean day" while zero real ticks ever arrived. Before trusting
+    a "clean" verdict from the log, confirm at least one row landed
+    *somewhere* (any symbol) during the session window that day. This is
+    one cheap query per day, not per symbol, so it doesn't undo the
+    performance benefit of the log-based fast path.
+    """
+    day_start_ms = int(session_start.timestamp() * 1000)
+    day_end_ms   = int(session_end.timestamp() * 1000)
+
+    for db_path in db_paths:
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                cur = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name LIKE 'quote_%'"
+                )
+                tables = [row[0] for row in cur.fetchall()]
+                for table in tables:
+                    cur = conn.execute(
+                        f"SELECT 1 FROM {table} "
+                        f"WHERE timestamp >= ? AND timestamp < ? LIMIT 1",
+                        (day_start_ms, day_end_ms),
+                    )
+                    if cur.fetchone():
+                        return True
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            print(
+                f"[BACKFILL][WARN] error during day-data sanity check on "
+                f"{db_path.name}: {exc}",
+                flush=True,
+            )
+
+    return False
 
 
 def _second_level_gaps(
@@ -408,6 +483,19 @@ def _find_symbol_gaps(
                         f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
                         flush=True,
                     )
+            elif not log_windows and first_time_for_day:
+                # Log says "clean" — verify that's actually true before
+                # trusting it. See _day_has_any_data docstring for why.
+                if not _day_has_any_data(db_paths, day, session_start, session_end):
+                    print(
+                        f"[BACKFILL][WARN] {day} connection log reports a clean "
+                        "day, but zero rows exist for ANY symbol in that window "
+                        "— overriding to a full-day gap (likely a silent auth "
+                        "failure that never triggered a logged disconnect)",
+                        flush=True,
+                    )
+                    log_windows_cache[day] = [(session_start, session_end)]
+                    log_windows = log_windows_cache[day]
             if log_windows:
                 gaps.extend(log_windows)
             # else: log confirms a clean day — nothing to do, no scan needed
@@ -832,7 +920,9 @@ class BackfillManager:
                 _progress_write(
                     f"[BACKFILL] checking history DB... {checked}/{total_symbols} symbols "
                     f"| {fully_present_total} window(s) already present "
-                    f"| {partial_total} partial | {len(all_gaps)} symbol(s) need fetch"
+                    f"| {partial_total} partial | {len(all_gaps)} symbol(s) need fetch",
+                    index=checked,
+                    total=total_symbols,
                 )
 
             _progress_done()
@@ -884,7 +974,9 @@ class BackfillManager:
                         f"| {exchange}:{symbol} "
                         f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
                         f"{window_end.strftime('%H:%M')} "
-                        f"| {total_rows + symbol_rows} candle(s) queued so far"
+                        f"| {total_rows + symbol_rows} candle(s) queued so far",
+                        index=windows_done,
+                        total=total_windows,
                     )
                 total_rows += symbol_rows
 
