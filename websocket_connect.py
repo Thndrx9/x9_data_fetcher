@@ -5,7 +5,11 @@ from typing import List, Optional
 import websockets
 
 from x9_data_fetcher import connection_log
-from x9_data_fetcher.event_bus import market_data_queue
+from x9_data_fetcher.event_bus import (
+    market_data_queue,
+    mark_ws_connected,
+    mark_ws_disconnected,
+)
 from x9_data_fetcher.market_time import now_kolkata
 
 DEFAULT_WS_URL = "ws://127.0.0.1:8765"
@@ -79,6 +83,9 @@ async def websocket_client(
                         flush=True,
                     )
 
+                # connection is authenticated + subscribed — safe to treat as "live"
+                mark_ws_connected(mode_label)
+
                 loop = asyncio.get_running_loop()
                 last_rx_at = loop.time()
 
@@ -109,6 +116,7 @@ async def websocket_client(
                     hb_task.cancel()
                     await asyncio.gather(hb_task, return_exceptions=True)
         except asyncio.CancelledError:
+            mark_ws_disconnected(mode_label)
             if conn_log_dir:
                 connection_log.log_event(
                     conn_log_dir, "DISCONNECTED", now_kolkata(),
@@ -116,6 +124,7 @@ async def websocket_client(
                 )
             raise
         except Exception as exc:
+            mark_ws_disconnected(mode_label)
             if conn_log_dir:
                 connection_log.log_event(
                     conn_log_dir, "DISCONNECTED", now_kolkata(),

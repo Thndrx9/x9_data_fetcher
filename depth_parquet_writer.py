@@ -12,7 +12,7 @@ from typing import Dict, List, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from market_time import MARKET_CLOSE, is_trading_day, now_kolkata
+from x9_data_fetcher.market_time import MARKET_CLOSE, is_trading_day, now_kolkata
 
 
 IST = ZoneInfo("Asia/Kolkata")
