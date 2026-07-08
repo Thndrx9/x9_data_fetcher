@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from urllib.error import URLError
 import psycopg2
 
 from x9_data_fetcher import connection_log
+from x9_data_fetcher.event_bus import is_ws_connected
 from x9_data_fetcher.market_time import (
     MARKET_CLOSE,
     MARKET_OPEN,
@@ -28,6 +30,24 @@ HistoryWindow = Tuple[datetime, datetime]
 # Second-level gap detection constants
 _GAP_TOLERANCE_MS   = 90_000   # 90 s — absorbs minor tick-timing jitter
 _CANDLE_INTERVAL_MS = 60_000   # 1-minute candle width
+
+
+def _progress_write(text: str) -> None:
+    """
+    Overwrite the current terminal line with new progress text (no newline).
+    Used for high-frequency per-symbol status so 180+ symbols don't scroll
+    the log — only the latest status is visible, and it clears itself when
+    a permanent (newline-terminated) message needs to be printed next.
+    "\\033[K" clears anything left over from a longer previous line.
+    """
+    sys.stdout.write(f"\r{text}\033[K")
+    sys.stdout.flush()
+
+
+def _progress_done() -> None:
+    """Finalize the current progress line so the next print starts fresh."""
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +389,8 @@ def _find_symbol_gaps(
             session_end   = _session_last_candle(day)
 
         # ── try the connection log first (cached per day across symbols) ──
-        if day not in log_windows_cache:
+        first_time_for_day = day not in log_windows_cache
+        if first_time_for_day:
             log_windows_cache[day] = (
                 _day_windows_from_log(quote_output_dir, day, session_start, session_end, now)
                 if quote_output_dir else None
@@ -377,13 +398,17 @@ def _find_symbol_gaps(
         log_windows = log_windows_cache[day]
 
         if log_windows is not None:
-            if log_windows:
+            # Log-derived windows are system-wide (same outage applies to
+            # every symbol) — only print them the first time they're
+            # computed for this day, not once per symbol that reuses them.
+            if log_windows and first_time_for_day:
                 for g in log_windows:
                     print(
-                        f"[BACKFILL] {symbol} {day} LOG gap: "
+                        f"[BACKFILL] {day} LOG gap (all symbols): "
                         f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
                         flush=True,
                     )
+            if log_windows:
                 gaps.extend(log_windows)
             # else: log confirms a clean day — nothing to do, no scan needed
             continue
@@ -540,9 +565,18 @@ def _filter_gaps_already_in_history(
     symbol: str,
     exchange: str,
     gaps: List[HistoryWindow],
-) -> List[HistoryWindow]:
+) -> Tuple[List[HistoryWindow], int, int]:
+    """
+    Returns (remaining_gaps, fully_present_count, partially_present_count).
+
+    Stays silent by design — with 100+ symbols this gets called once per
+    symbol per run, so printing here would flood the log. The caller
+    aggregates these counts into a single progress line + one summary.
+    """
     table = f"quote_{_safe_symbol(symbol)}".lower()
     remaining: List[HistoryWindow] = []
+    fully_present = 0
+    partially_present = 0
 
     for window_start, window_end in gaps:
         timestamps = _history_timestamps_for_window(
@@ -557,26 +591,14 @@ def _filter_gaps_already_in_history(
 
         missing_windows = _second_level_gaps(timestamps, window_start, window_end)
         if not missing_windows:
-            print(
-                f"[BACKFILL] {exchange}:{symbol} "
-                f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
-                f"{window_end.strftime('%H:%M')} "
-                "already present in history DB, skipping",
-                flush=True,
-            )
+            fully_present += 1
             continue
 
         if missing_windows != [(window_start, window_end)]:
-            print(
-                f"[BACKFILL] {exchange}:{symbol} "
-                f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
-                f"{window_end.strftime('%H:%M')} "
-                f"partially present in history DB, fetching {len(missing_windows)} gap(s)",
-                flush=True,
-            )
+            partially_present += 1
         remaining.extend(missing_windows)
 
-    return remaining
+    return remaining, fully_present, partially_present
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +734,19 @@ class BackfillManager:
 
     async def _wait_for_completed_minute(self) -> None:
         now = now_kolkata()
+
+        # Only worth waiting for a clean minute boundary if ticks could
+        # actually be arriving right now (market open or a websocket is
+        # live). Otherwise there's no in-progress candle to protect
+        # against — scan immediately.
+        if not is_market_open(now) and not is_ws_connected():
+            print(
+                "[BACKFILL] market closed and no websocket connected "
+                "— skipping wait, scanning now",
+                flush=True,
+            )
+            return
+
         delay = 60 - now.second - (now.microsecond / 1_000_000)
         if delay >= 60:
             delay = 0
@@ -753,6 +788,11 @@ class BackfillManager:
             )
 
         try:
+            total_symbols = len(self.symbols)
+            checked = 0
+            fully_present_total = 0
+            partial_total = 0
+
             for symbol_row in self.symbols:
                 symbol   = str(symbol_row["symbol"]).upper()
                 exchange = str(symbol_row.get("exchange") or "NSE").upper()
@@ -769,13 +809,16 @@ class BackfillManager:
 
                 if gaps and history_conn is not None:
                     try:
-                        gaps = _filter_gaps_already_in_history(
+                        gaps, fully_present, partial = _filter_gaps_already_in_history(
                             history_conn,
                             symbol,
                             exchange,
                             gaps,
                         )
+                        fully_present_total += fully_present
+                        partial_total += partial
                     except Exception as exc:
+                        _progress_done()
                         print(
                             f"[BACKFILL][WARN] history DB check failed for "
                             f"{exchange}:{symbol}: {exc}",
@@ -784,6 +827,15 @@ class BackfillManager:
 
                 if gaps:
                     all_gaps[symbol] = (exchange, gaps)
+
+                checked += 1
+                _progress_write(
+                    f"[BACKFILL] checking history DB... {checked}/{total_symbols} symbols "
+                    f"| {fully_present_total} window(s) already present "
+                    f"| {partial_total} partial | {len(all_gaps)} symbol(s) need fetch"
+                )
+
+            _progress_done()
         finally:
             if history_conn is not None:
                 try:
@@ -798,7 +850,8 @@ class BackfillManager:
         total_windows = sum(len(v[1]) for v in all_gaps.values())
         print(
             f"[BACKFILL] {len(all_gaps)} symbol(s) need recovery "
-            f"across {total_windows} window(s) → PG database '{self.history_dbname}'",
+            f"across {total_windows} window(s) → PG database '{self.history_dbname}' "
+            f"({fully_present_total} window(s) skipped, already in history DB)",
             flush=True,
         )
 
@@ -814,6 +867,8 @@ class BackfillManager:
         # ── fetch and enqueue ─────────────────────────────────────────────
         try:
             total_rows = 0
+            windows_done = 0
+
             for symbol, (exchange, gaps) in all_gaps.items():
                 symbol_rows = 0
                 for window_start, window_end in gaps:
@@ -823,15 +878,17 @@ class BackfillManager:
                     for candle in candles:
                         self._writer.enqueue(symbol, candle)
                     symbol_rows += len(candles)
-                    print(
-                        f"[BACKFILL] {exchange}:{symbol} "
+                    windows_done += 1
+                    _progress_write(
+                        f"[BACKFILL] fetching {windows_done}/{total_windows} window(s) "
+                        f"| {exchange}:{symbol} "
                         f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
                         f"{window_end.strftime('%H:%M')} "
-                        f"fetched {len(candles)} candle(s)",
-                        flush=True,
+                        f"| {total_rows + symbol_rows} candle(s) queued so far"
                     )
                 total_rows += symbol_rows
 
+            _progress_done()
             print(f"[BACKFILL] total {total_rows} candle(s) queued", flush=True)
 
         finally:
