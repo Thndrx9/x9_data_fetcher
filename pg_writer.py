@@ -50,6 +50,7 @@ import os
 import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -138,6 +139,15 @@ def _conn_params(dbname: Optional[str] = None) -> dict:
         "dbname":   dbname or os.getenv("PG_DBNAME", "market"),
         "user":     os.getenv("PG_USER",     "collector"),
         "password": os.getenv("PG_PASSWORD", ""),
+        # Bound TCP connect time so a dead/unreachable host fails fast
+        # instead of hanging on the OS-level connect() syscall.
+        "connect_timeout": int(os.getenv("PG_CONNECT_TIMEOUT_SEC", "10")),
+        # Bound how long any single query (INSERT/COMMIT/etc.) can run
+        # server-side. Without this, a stalled network path or a wedged
+        # server can leave the writer thread blocked inside execute()/
+        # commit() with no way to notice _stop was set — which is what
+        # makes shutdown() hang forever on thread.join().
+        "options": f"-c statement_timeout={int(os.getenv('PG_STATEMENT_TIMEOUT_SEC', '10')) * 1000}",
     }
 
 
@@ -597,6 +607,105 @@ def _parse(row: dict) -> tuple:
     )
 
 
+# Retrying failed flushes is only safe if the retry buffer can't grow
+# without bound — if PG is down for an extended period, ticks keep
+# arriving from the websocket faster than they can be retried, and an
+# uncapped buffer would eventually exhaust memory. Cap it per symbol and
+# drop the OLDEST rows once the cap is hit (keep the freshest data,
+# since for live market data recency matters more than completeness of
+# an already-large gap — a big gap gets fully recovered later via
+# BackfillManager/DailyCloseManager anyway).
+_MAX_RETRY_ROWS_PER_SYMBOL = int(os.getenv("PG_MAX_RETRY_ROWS_PER_SYMBOL", "20000"))
+
+
+def _cap_retry_rows(symbol: str, rows: List[dict], tag: str) -> List[dict]:
+    if len(rows) <= _MAX_RETRY_ROWS_PER_SYMBOL:
+        return rows
+    dropped = len(rows) - _MAX_RETRY_ROWS_PER_SYMBOL
+    _safe_print(
+        f"{tag}[WARN] retry buffer for {symbol} exceeded "
+        f"{_MAX_RETRY_ROWS_PER_SYMBOL} rows — dropping {dropped} oldest "
+        f"row(s) (PG likely down for a while; full history still safe in "
+        f"SQLite/Parquet and recoverable via backfill)"
+    )
+    return rows[-_MAX_RETRY_ROWS_PER_SYMBOL:]
+
+
+# ---------------------------------------------------------------------------
+# Shutdown spillover — a local SQLite file (same storage style already used
+# by the depth/quote writers) that catches rows still sitting in memory if
+# the process is killed before a final PG flush can succeed. Loaded back in
+# and retried against PG the next time this writer starts up.
+# ---------------------------------------------------------------------------
+
+_SPILLOVER_DIR = os.getenv("X9_PG_SPILLOVER_DIR", ".")
+
+
+def _spillover_path(table: str) -> Path:
+    return Path(_SPILLOVER_DIR) / f"pg_{table}_spillover.db"
+
+
+def _spillover_write(table: str, buffered: Dict[str, List[dict]], tag: str) -> None:
+    pending = {sym: rows for sym, rows in buffered.items() if rows}
+    if not pending:
+        return
+    path = _spillover_path(table)
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS spillover ("
+            " symbol TEXT, timestamp TEXT, ingest_ns INTEGER, raw_json TEXT)"
+        )
+        rows_to_write = [
+            (sym, row.get("timestamp"), row.get("ingest_ns"), row.get("raw_json"))
+            for sym, rows in pending.items()
+            for row in rows
+        ]
+        conn.executemany(
+            "INSERT INTO spillover (symbol, timestamp, ingest_ns, raw_json) "
+            "VALUES (?, ?, ?, ?)",
+            rows_to_write,
+        )
+        conn.commit()
+        conn.close()
+        _safe_print(
+            f"{tag}[WARN] shutdown with {len(rows_to_write)} unflushed row(s) "
+            f"— saved to {path} for retry on next startup"
+        )
+    except Exception as exc:
+        _safe_print(
+            f"{tag}[ERROR] failed to save {sum(len(r) for r in pending.values())} "
+            f"unflushed row(s) to spillover file: {exc} — these rows are lost"
+        )
+
+
+def _spillover_load(table: str, tag: str) -> Dict[str, List[dict]]:
+    path = _spillover_path(table)
+    if not path.exists():
+        return {}
+    recovered: Dict[str, List[dict]] = {}
+    try:
+        conn = sqlite3.connect(path)
+        cur = conn.execute("SELECT symbol, timestamp, ingest_ns, raw_json FROM spillover")
+        for symbol, timestamp, ingest_ns, raw_json in cur.fetchall():
+            recovered.setdefault(symbol, []).append(
+                {"timestamp": timestamp, "ingest_ns": ingest_ns, "raw_json": raw_json}
+            )
+        conn.close()
+        # consumed — remove so we don't replay the same rows again on a
+        # future startup if this run also fails to flush them
+        path.unlink()
+        if recovered:
+            total = sum(len(v) for v in recovered.values())
+            _safe_print(
+                f"{tag} recovered {total} row(s) from previous shutdown "
+                f"({path.name}) — retrying against PG"
+            )
+    except Exception as exc:
+        _safe_print(f"{tag}[ERROR] failed to load spillover file {path}: {exc}")
+    return recovered
+
+
 # ---------------------------------------------------------------------------
 # Writer class
 # ---------------------------------------------------------------------------
@@ -685,6 +794,11 @@ class PgWriter:
 
         known_tables = _load_existing_tables(conn, self.table)
 
+        # recover anything left over from a previous run that got killed
+        # before it could flush — merge in so the next flush cycle retries it
+        for symbol, rows in _spillover_load(self.table, self._tag).items():
+            buffered.setdefault(symbol, []).extend(rows)
+
         while True:
             if self._stop.is_set() and self._q.empty():
                 break
@@ -711,6 +825,11 @@ class PgWriter:
             except Exception:
                 pass
 
+        # final flush may itself have failed (e.g. PG unreachable at the
+        # exact moment of shutdown) — anything still buffered would
+        # otherwise be silently lost when this thread exits
+        _spillover_write(self.table, buffered, self._tag)
+
     def _flush(
         self,
         conn: Optional[psycopg2.extensions.connection],
@@ -718,47 +837,84 @@ class PgWriter:
         known_tables: Set[str],
     ):
         any_rows = False
+        # rows that were execute_values'd this round but not yet committed —
+        # if the commit fails, these get put back in `buffered` so the next
+        # flush retries them instead of the data being silently lost.
+        pending_commit: Dict[str, List[dict]] = {}
 
-        for sym, rows in buffered.items():
+        for sym, rows in list(buffered.items()):
             if not rows:
                 continue
 
             try:
                 table = _ensure_table(conn, self.table, sym, known_tables, self._dedup)
             except Exception as exc:
-                _safe_print(f"{self._tag}[ERROR] ensure table failed for {sym}: {exc}")
-                buffered[sym] = []
+                _safe_print(
+                    f"{self._tag}[ERROR] ensure table failed for {sym}: {exc} "
+                    f"— {len(rows)} row(s) kept for retry next flush"
+                )
+                # retried next round, but still capped in case this keeps
+                # failing indefinitely (e.g. a permissions problem)
+                buffered[sym] = _cap_retry_rows(sym, rows, self._tag)
                 continue
 
-            sql    = _insert_sql(table, self._dedup)
-            parsed: List[tuple] = []
+            sql = _insert_sql(table, self._dedup)
 
+            # keep parsed rows paired with their original raw row so a failed
+            # insert can put the *raw* row back for retry (parsing is cheap
+            # and idempotent, no need to cache the parsed tuple across a retry)
+            good_raw: List[dict] = []
+            good_parsed: List[tuple] = []
+            bad_count = 0
             for row in rows:
                 try:
-                    parsed.append(_parse(row))
+                    good_parsed.append(_parse(row))
+                    good_raw.append(row)
                 except Exception as exc:
+                    bad_count += 1
                     _safe_print(f"{self._tag}[ERROR] parse failed for {sym}: {exc}")
 
-            if parsed:
+            if bad_count:
+                _safe_print(
+                    f"{self._tag}[ERROR] {bad_count} row(s) for {sym} permanently "
+                    f"dropped (malformed — would fail parsing again on retry)"
+                )
+
+            if good_parsed:
                 try:
                     cur = conn.cursor()
-                    psycopg2.extras.execute_values(cur, sql, parsed)
+                    psycopg2.extras.execute_values(cur, sql, good_parsed)
                     any_rows = True
+                    pending_commit[sym] = good_raw
+                    buffered[sym] = []  # tentatively cleared; restored below if commit fails
                 except Exception as exc:
-                    _safe_print(f"{self._tag}[ERROR] insert failed for {sym}: {exc}")
-
-            buffered[sym] = []
+                    _safe_print(
+                        f"{self._tag}[ERROR] insert failed for {sym}: {exc} "
+                        f"— {len(good_raw)} row(s) kept for retry next flush"
+                    )
+                    buffered[sym] = _cap_retry_rows(sym, good_raw, self._tag)
+            else:
+                buffered[sym] = []
 
         if any_rows:
             try:
                 conn.commit()
             except Exception as exc:
-                _safe_print(f"{self._tag}[ERROR] commit failed: {exc} — reconnecting")
+                total_retry = sum(len(v) for v in pending_commit.values())
+                _safe_print(
+                    f"{self._tag}[ERROR] commit failed: {exc} — reconnecting, "
+                    f"{total_retry} row(s) kept for retry next flush"
+                )
                 try:
                     conn.close()
                 except Exception:
                     pass
                 conn = self._connect()
                 known_tables = _load_existing_tables(conn, self.table) if conn else set()
+                # transaction rolled back (or connection is gone) — put the
+                # rows that were execute_values'd but never committed back
+                # into buffered so the next flush retries them
+                for sym, rows in pending_commit.items():
+                    buffered[sym] = _cap_retry_rows(sym, rows + buffered.get(sym, []), self._tag)
 
         return conn, known_tables
