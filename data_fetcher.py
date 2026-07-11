@@ -155,9 +155,18 @@ class MarketDataFetcher:
                 market_data_queue.task_done()
 
     def shutdown(self):
-        self.ohlc_writer.shutdown()
-        self.depth_writer.shutdown()
+        # Bounded timeouts here are load-bearing: without them,
+        # Thread.join(timeout=None) blocks forever if a writer thread is
+        # stuck (e.g. a PG flush wedged on a stalled network call), which
+        # keeps the process alive holding the singleton lock file and
+        # produces the "another instance is already running" error on
+        # the next restart even though the old process looks hung, not
+        # crashed. SQLite writers poll every 0.25s so they exit almost
+        # immediately; PG writers get longer since a real commit may be
+        # mid-flight, but never wait indefinitely.
+        self.ohlc_writer.shutdown(timeout=5)
+        self.depth_writer.shutdown(timeout=5)
         if self.quote_pg_writer:
-            self.quote_pg_writer.shutdown()
+            self.quote_pg_writer.shutdown(timeout=15)
         if self.depth_pg_writer:
-            self.depth_pg_writer.shutdown()
+            self.depth_pg_writer.shutdown(timeout=15)
