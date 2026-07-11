@@ -51,6 +51,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -67,6 +68,38 @@ from x9_data_fetcher.market_time import MARKET_OPEN, is_trading_day, now_kolkata
 
 
 IST = ZoneInfo("Asia/Kolkata")
+
+# ---------------------------------------------------------------------------
+# Console coordination — prevents background writer-thread prints from
+# garbling a live progress line
+# ---------------------------------------------------------------------------
+#
+# backfill_manager._progress_write draws a single, live-updating line using
+# "\r...\033[K" with NO trailing newline. PgWriter's background flush
+# thread (table creation, insert errors, etc.) runs on a completely
+# separate thread and prints normally. If that print fires while a
+# progress line is open, it lands mid-line with no newline in between —
+# e.g. "...failed=0[PG_DAILY] new table: daily_reliance" all smashed onto
+# one line, exactly as seen in production.
+#
+# _console_lock + _progress_open are shared module state: backfill_manager
+# marks a progress line "open" while it's being drawn, and every print
+# that could plausibly fire from a different thread goes through
+# _safe_print(), which closes any open line with a newline first.
+
+_console_lock = threading.Lock()
+_progress_open = False   # True while a \r-based progress line has no trailing \n yet
+
+
+def _safe_print(text: str) -> None:
+    """Thread-safe print — closes any open \\r progress line first."""
+    global _progress_open
+    with _console_lock:
+        if _progress_open:
+            sys.stdout.write("\n")
+            _progress_open = False
+        print(text, flush=True)
+
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +415,7 @@ def _ensure_table(
         )
     conn.commit()
     known_tables.add(table)
-    print(f"[PG_{prefix.upper()}] new table: {table}", flush=True)
+    _safe_print(f"[PG_{prefix.upper()}] new table: {table}")
     return table
 
 
@@ -398,10 +431,7 @@ def _load_existing_tables(
     )
     tables = {row[0] for row in cur.fetchall()}
     if tables:
-        print(
-            f"[PG_{prefix.upper()}] found {len(tables)} existing tables",
-            flush=True,
-        )
+        _safe_print(f"[PG_{prefix.upper()}] found {len(tables)} existing tables")
     return tables
 
 
@@ -452,7 +482,7 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
     try:
         conn = psycopg2.connect(**_conn_params(dbname))
     except Exception as exc:
-        print(f"{tag}[ERROR] connect failed: {exc}", flush=True)
+        _safe_print(f"{tag}[ERROR] connect failed: {exc}")
         return
 
     try:
@@ -467,7 +497,7 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
         tables = [row[0] for row in cur.fetchall()]
 
         if not tables:
-            print(f"{tag} no {label} tables found — nothing to purge", flush=True)
+            _safe_print(f"{tag} no {label} tables found — nothing to purge")
             return
 
         total_deleted = 0
@@ -480,16 +510,15 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
                     tables_affected += 1
                     total_deleted += deleted
             except Exception as exc:
-                print(f"{tag}[ERROR] delete failed for {table}: {exc}", flush=True)
+                _safe_print(f"{tag}[ERROR] delete failed for {table}: {exc}")
                 conn.rollback()
                 cur = conn.cursor()  # cursor is dead after rollback — get a fresh one
                 continue
 
         conn.commit()
-        print(
+        _safe_print(
             f"{tag} {label}: purged {total_deleted} row(s) across "
-            f"{tables_affected}/{len(tables)} table(s) (cutoff={cutoff_ms})",
-            flush=True,
+            f"{tables_affected}/{len(tables)} table(s) (cutoff={cutoff_ms})"
         )
 
         # VACUUM reclaims disk space after large deletes, but can't run
@@ -501,8 +530,8 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
                 try:
                     vac_cur.execute(f"VACUUM {table}")
                 except Exception as exc:
-                    print(f"{tag}[WARN] vacuum failed for {table}: {exc}", flush=True)
-            print(f"{tag} {label}: vacuum complete", flush=True)
+                    _safe_print(f"{tag}[WARN] vacuum failed for {table}: {exc}")
+            _safe_print(f"{tag} {label}: vacuum complete")
 
     finally:
         try:
@@ -513,7 +542,7 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
 
 def purge_old_data(
     keep_trading_days: int = 3,
-    keep_daily_trading_days: int = 30,
+    keep_daily_trading_days: Optional[int] = None,
     now=None,
 ) -> None:
     """
@@ -526,23 +555,34 @@ def purge_old_data(
     close-price reference — while quote_/depth_ hold every tick and would
     grow unbounded if kept anywhere near that long.
 
+    `keep_daily_trading_days`, if not given explicitly, reads the SAME
+    X9_DAILY_BACKFILL_DAYS env var (default 30) that start_data.py's
+    startup daily-candle backfill uses. One shared knob — so retention and
+    the backfill catch-up window can't silently drift apart again (they
+    did: retention kept 30 trading days while backfill only ever caught up
+    the last 3, so any downtime beyond 3 days left a permanent hole).
+
     Safe to call even if PostgreSQL isn't configured/reachable — logs and
     returns rather than raising, so it can't take down the daily loop.
     """
+    if keep_daily_trading_days is None:
+        keep_daily_trading_days = max(
+            1, int(os.getenv("X9_DAILY_BACKFILL_DAYS", "30").strip() or "30")
+        )
+
     start = time.monotonic()
     now = now or now_kolkata()
     tick_cutoff_ms  = _cutoff_ms(now, keep_trading_days)
     daily_cutoff_ms = _cutoff_ms(now, keep_daily_trading_days)
-    print(
+    _safe_print(
         f"[RETENTION] starting purge — tick data: last {keep_trading_days} "
         f"trading day(s) (cutoff={tick_cutoff_ms}), daily candles: last "
-        f"{keep_daily_trading_days} trading day(s) (cutoff={daily_cutoff_ms})",
-        flush=True,
+        f"{keep_daily_trading_days} trading day(s) (cutoff={daily_cutoff_ms})"
     )
     for dbname in _configured_dbnames():
         _purge_db(dbname, ["quote_%", "depth_%"], tick_cutoff_ms, "tick data")
         _purge_db(dbname, ["daily_%"], daily_cutoff_ms, "daily candles")
-    print(f"[RETENTION] done in {time.monotonic() - start:.1f}s", flush=True)
+    _safe_print(f"[RETENTION] done in {time.monotonic() - start:.1f}s")
 
 
 def _parse(row: dict) -> tuple:
@@ -621,20 +661,17 @@ class PgWriter:
         self._stop.set()
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
-            print(f"{self._tag}[ERROR] shutdown timed out", flush=True)
+            _safe_print(f"{self._tag}[ERROR] shutdown timed out")
 
     def _connect(self) -> Optional[psycopg2.extensions.connection]:
         while not self._stop.is_set():
             try:
                 conn = psycopg2.connect(**self._params)
                 conn.autocommit = False
-                print(f"{self._tag} connected to PostgreSQL", flush=True)
+                _safe_print(f"{self._tag} connected to PostgreSQL")
                 return conn
             except Exception as exc:
-                print(
-                    f"{self._tag}[ERROR] connection failed: {exc} — retry in 5s",
-                    flush=True,
-                )
+                _safe_print(f"{self._tag}[ERROR] connection failed: {exc} — retry in 5s")
                 time.sleep(5)
         return None
 
@@ -689,7 +726,7 @@ class PgWriter:
             try:
                 table = _ensure_table(conn, self.table, sym, known_tables, self._dedup)
             except Exception as exc:
-                print(f"{self._tag}[ERROR] ensure table failed for {sym}: {exc}", flush=True)
+                _safe_print(f"{self._tag}[ERROR] ensure table failed for {sym}: {exc}")
                 buffered[sym] = []
                 continue
 
@@ -700,7 +737,7 @@ class PgWriter:
                 try:
                     parsed.append(_parse(row))
                 except Exception as exc:
-                    print(f"{self._tag}[ERROR] parse failed for {sym}: {exc}", flush=True)
+                    _safe_print(f"{self._tag}[ERROR] parse failed for {sym}: {exc}")
 
             if parsed:
                 try:
@@ -708,7 +745,7 @@ class PgWriter:
                     psycopg2.extras.execute_values(cur, sql, parsed)
                     any_rows = True
                 except Exception as exc:
-                    print(f"{self._tag}[ERROR] insert failed for {sym}: {exc}", flush=True)
+                    _safe_print(f"{self._tag}[ERROR] insert failed for {sym}: {exc}")
 
             buffered[sym] = []
 
@@ -716,7 +753,7 @@ class PgWriter:
             try:
                 conn.commit()
             except Exception as exc:
-                print(f"{self._tag}[ERROR] commit failed: {exc} — reconnecting", flush=True)
+                _safe_print(f"{self._tag}[ERROR] commit failed: {exc} — reconnecting")
                 try:
                     conn.close()
                 except Exception:
