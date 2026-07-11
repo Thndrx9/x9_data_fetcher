@@ -1,35 +1,42 @@
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import request
 from urllib.error import URLError
 
-import psycopg2
-
-from x9_data_fetcher import connection_log
 from x9_data_fetcher.event_bus import is_ws_connected
+from x9_data_fetcher.gap_detector import (
+    HistoryWindow,
+    _candidate_db_paths,
+    _filter_gaps_already_in_history,
+    _find_symbol_gaps,
+    _history_connection,
+    _last_n_trading_days,
+    _missing_daily_days,
+    _ms_to_ist,
+    _previous_trading_day,  # noqa: F401 — re-exported for start_data.py
+    _to_ms,
+)
 from x9_data_fetcher.market_time import (
     MARKET_CLOSE,
-    MARKET_OPEN,
     is_market_open,
-    is_trading_day,
     now_kolkata,
     tz_kolkata,
 )
-from x9_data_fetcher.pg_writer import PgWriter, _conn_params
+from x9_data_fetcher.pg_writer import PgWriter
 
 
-HistoryWindow = Tuple[datetime, datetime]
-
-# Second-level gap detection constants
-_GAP_TOLERANCE_MS   = 90_000   # 90 s — absorbs minor tick-timing jitter
-_CANDLE_INTERVAL_MS = 60_000   # 1-minute candle width
+# Second-level gap detection constants are owned by gap_detector.py now;
+# kept as aliases here only in case anything external still imports them
+# from this module.
+_CANDLE_INTERVAL_MS = 60_000
 
 
 _IS_TTY = sys.stdout.isatty()
@@ -57,8 +64,22 @@ def _progress_write(text: str, *, index: Optional[int] = None, total: Optional[i
 
     `index`/`total` are only needed for the non-tty fallback; omit them if
     you don't have a periodic count to give (the tty path ignores them).
+
+    Long lines are truncated to the terminal's current column width. This
+    matters because "\\r" only rewinds the cursor to the start of the
+    *current visual row* — if the text is wider than the terminal and wraps
+    onto a second row, "\\r" just rewinds that wrapped remainder, leaving
+    the first row's tail behind on every update. That's what produces a
+    stack of seemingly-separate lines even though this is a real tty and
+    "\\r" is working exactly as designed.
     """
     if _IS_TTY:
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        # leave 1 col of headroom — writing into the very last column can
+        # itself trigger an auto-wrap on some terminals
+        max_len = max(width - 1, 1)
+        if len(text) > max_len:
+            text = text[: max_len - 1] + "…"
         sys.stdout.write(f"\r{text}\033[K")
         sys.stdout.flush()
         return
@@ -76,458 +97,6 @@ def _progress_done() -> None:
         sys.stdout.write("\n")
         sys.stdout.flush()
     # non-tty: nothing to finalize — periodic plain lines already have newlines
-
-
-# ---------------------------------------------------------------------------
-# Timestamp helpers
-# ---------------------------------------------------------------------------
-
-def _to_ms(value: Any) -> Optional[int]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        numeric = float(value)
-        if numeric > 1_000_000_000_000_000:
-            return int(numeric / 1_000_000)
-        if numeric > 10_000_000_000:
-            return int(numeric)
-        return int(numeric * 1000)
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        try:
-            return _to_ms(float(raw))
-        except ValueError:
-            pass
-        normalized = raw.replace("Z", "+00:00")
-        for fmt in (
-            None,
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%dT%H:%M",
-            "%Y-%m-%d",
-        ):
-            try:
-                if fmt is None:
-                    dt = datetime.fromisoformat(normalized)
-                else:
-                    dt = datetime.strptime(raw, fmt)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=tz_kolkata)
-                return int(dt.astimezone(timezone.utc).timestamp() * 1000)
-            except ValueError:
-                continue
-    return None
-
-
-def _ms_to_ist(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(tz_kolkata)
-
-
-def _floor_minute(dt: datetime) -> datetime:
-    return dt.replace(second=0, microsecond=0)
-
-
-def _session_open(day: date) -> datetime:
-    return datetime.combine(day, MARKET_OPEN, tzinfo=tz_kolkata)
-
-
-def _session_last_candle(day: date) -> datetime:
-    close_dt = datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata)
-    return close_dt - timedelta(minutes=1)
-
-
-def _previous_trading_day(day: date) -> Optional[date]:
-    cursor = day - timedelta(days=1)
-    for _ in range(30):
-        if is_trading_day(cursor):
-            return cursor
-        cursor -= timedelta(days=1)
-    return None
-
-
-def _latest_completed_candle(now: datetime) -> Optional[datetime]:
-    minute_start = _floor_minute(now) - timedelta(minutes=1)
-    if is_trading_day(now.date()) and MARKET_OPEN <= minute_start.time() < MARKET_CLOSE:
-        return minute_start
-    if is_trading_day(now.date()) and now.time() >= MARKET_CLOSE:
-        return _session_last_candle(now.date())
-    previous_day = _previous_trading_day(now.date())
-    if previous_day is None:
-        return None
-    return _session_last_candle(previous_day)
-
-
-# ---------------------------------------------------------------------------
-# Gap detection helpers
-# ---------------------------------------------------------------------------
-
-def _safe_symbol(symbol: str) -> str:
-    """Match SQLite table naming convention."""
-    return "".join(c for c in symbol if c.isalnum() or c == "_")
-
-
-def _last_n_trading_days(reference: datetime, n: int) -> List[date]:
-    """
-    Return the last n trading days ending on reference.date() (inclusive
-    if reference.date() is a trading day). Chronological order.
-    """
-    result: List[date] = []
-    cursor = reference.date()
-    for _ in range(n * 5):          # look back up to 5× n calendar days
-        if is_trading_day(cursor):
-            result.append(cursor)
-            if len(result) == n:
-                break
-        cursor -= timedelta(days=1)
-    return list(reversed(result))   # oldest → newest
-
-
-def _candidate_db_paths(base_dir: Path) -> List[Path]:
-    return sorted(base_dir.glob("market_*.db"), key=lambda p: p.name, reverse=True)
-
-
-def _get_timestamps_for_day(
-    db_paths: List[Path], table: str, day: date
-) -> List[int]:
-    """
-    Pull every raw timestamp (ms) stored for *symbol* on *day* across all
-    SQLite DB files.  Returns a sorted, deduplicated list.
-    """
-    day_start_ms = int(
-        datetime.combine(day, MARKET_OPEN, tzinfo=tz_kolkata).timestamp() * 1000
-    )
-    day_end_ms = int(
-        datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata).timestamp() * 1000
-    )
-    timestamps: List[int] = []
-
-    for db_path in db_paths:
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                cur = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                    (table,),
-                )
-                if not cur.fetchone():
-                    continue
-                cur = conn.execute(
-                    f"SELECT timestamp FROM {table} "
-                    f"WHERE timestamp >= ? AND timestamp < ?",
-                    (day_start_ms, day_end_ms),
-                )
-                for (raw_ts,) in cur.fetchall():
-                    ts_ms = _to_ms(raw_ts)
-                    if ts_ms is not None:
-                        timestamps.append(ts_ms)
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
-            print(f"[BACKFILL][WARN] error reading {db_path.name}: {exc}", flush=True)
-
-    return sorted(set(timestamps))
-
-
-def _day_has_any_data(
-    db_paths: List[Path], day: date, session_start: datetime, session_end: datetime
-) -> bool:
-    """
-    C — belt-and-suspenders check for the log-based fast path.
-
-    The connection log only tracks socket-level connect/disconnect state.
-    If auth is silently rejected in a way that doesn't close the socket
-    (or a token expires mid-session without a clean disconnect), the log
-    can say "clean day" while zero real ticks ever arrived. Before trusting
-    a "clean" verdict from the log, confirm at least one row landed
-    *somewhere* (any symbol) during the session window that day. This is
-    one cheap query per day, not per symbol, so it doesn't undo the
-    performance benefit of the log-based fast path.
-    """
-    day_start_ms = int(session_start.timestamp() * 1000)
-    day_end_ms   = int(session_end.timestamp() * 1000)
-
-    for db_path in db_paths:
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                cur = conn.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type='table' AND name LIKE 'quote_%'"
-                )
-                tables = [row[0] for row in cur.fetchall()]
-                for table in tables:
-                    cur = conn.execute(
-                        f"SELECT 1 FROM {table} "
-                        f"WHERE timestamp >= ? AND timestamp < ? LIMIT 1",
-                        (day_start_ms, day_end_ms),
-                    )
-                    if cur.fetchone():
-                        return True
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
-            print(
-                f"[BACKFILL][WARN] error during day-data sanity check on "
-                f"{db_path.name}: {exc}",
-                flush=True,
-            )
-
-    return False
-
-
-def _second_level_gaps(
-    timestamps_ms: List[int],
-    session_start: datetime,
-    session_end: datetime,
-) -> List[HistoryWindow]:
-    """
-    Walk a sorted timestamp sequence and return every missing window.
-
-    Leading edge  — gap before the first tick
-    Middle gaps   — consecutive pair separation > candle_interval + tolerance
-    Trailing edge — gap after the last tick before session_end
-    """
-    if session_start > session_end:
-        return []
-
-    session_start_ms = int(session_start.astimezone(timezone.utc).timestamp() * 1000)
-    session_end_ms   = int(session_end.astimezone(timezone.utc).timestamp() * 1000)
-
-    # Keep only timestamps that fall inside (or just beyond) the session window
-    ts = sorted(
-        t for t in timestamps_ms
-        if session_start_ms <= t <= session_end_ms + _GAP_TOLERANCE_MS
-    )
-
-    if not ts:
-        return [(session_start, session_end)]
-
-    gaps: List[HistoryWindow] = []
-
-    # ── leading edge ─────────────────────────────────────────────────────
-    if ts[0] > session_start_ms + _GAP_TOLERANCE_MS:
-        gap_end = _ms_to_ist(ts[0] - _CANDLE_INTERVAL_MS)
-        if session_start <= gap_end:
-            gaps.append((session_start, gap_end))
-
-    # ── middle gaps ───────────────────────────────────────────────────────
-    for i in range(len(ts) - 1):
-        diff = ts[i + 1] - ts[i]
-        if diff > _CANDLE_INTERVAL_MS + _GAP_TOLERANCE_MS:
-            gap_start = _ms_to_ist(ts[i]     + _CANDLE_INTERVAL_MS)
-            gap_end   = _ms_to_ist(ts[i + 1] - _CANDLE_INTERVAL_MS)
-            if gap_start <= gap_end:
-                gaps.append((gap_start, gap_end))
-
-    # ── trailing edge ─────────────────────────────────────────────────────
-    if ts[-1] < session_end_ms - _GAP_TOLERANCE_MS:
-        gap_start = _ms_to_ist(ts[-1] + _CANDLE_INTERVAL_MS)
-        if gap_start <= session_end:
-            gaps.append((gap_start, session_end))
-
-    return gaps
-
-
-def _day_windows_from_log(
-    quote_output_dir: str,
-    day: date,
-    session_start: datetime,
-    session_end: datetime,
-    now: datetime,
-) -> Optional[List[HistoryWindow]]:
-    """
-    Derive gap windows for `day` purely from the connection log — no SQLite
-    scanning needed.  These windows are system-wide (the feed was down for
-    every symbol), so they're computed once per day and reused for every
-    symbol needing backfill.
-
-    Returns:
-        None        — no log data for this day at all → caller must fall
-                       back to the per-symbol timestamp scan (old behaviour)
-        []          — log shows a clean day (connected, no disconnects)
-        [(s, e), …] — exact outage windows derived from DISCONNECTED/
-                       RECONNECTED pairs, or the full session if
-                       DAY_NOT_STARTED was recorded
-    """
-    events = connection_log.get_events_for_day(quote_output_dir, day)
-    if not events:
-        return None   # no log info — fall back to data scan
-
-    if any(e[0] == "DAY_NOT_STARTED" for e in events):
-        return [(session_start, session_end)]
-
-    if not any(e[0] in ("DAY_STARTED", "RECONNECTED") for e in events):
-        # log has rows but none indicate a successful connection — ambiguous,
-        # safer to fall back to a real data scan
-        return None
-
-    windows: List[HistoryWindow] = []
-    pending_disconnect_ms: Optional[int] = None
-
-    # ── leading edge ─────────────────────────────────────────────────────
-    # If the very first event is DAY_STARTED and it happens after session
-    # open, the system started mid-session (or restarted fresh with no
-    # prior connection today) — everything from open to that first
-    # connection is missing and was never recorded as a DISCONNECTED event
-    # because there was no earlier connection to disconnect from.
-    #
-    # Boundaries are snapped to full MINUTE boundaries, not exact seconds.
-    # Candles are stamped by their OPEN time (e.g. the 11:45 candle is
-    # timestamped 11:45:00). If a disconnect/reconnect happens mid-minute
-    # and the window used the exact second, the fetch filter would exclude
-    # that candle entirely (its 11:45:00 stamp falls before an 11:45:50
-    # window start) — silently losing a partially-affected candle. Snapping
-    # to the minute containing the event ensures any touched candle is
-    # always re-fetched in full from the authoritative history API.
-    first_event, first_ts_ms, _first_mode = events[0]
-    if first_event == "DAY_STARTED":
-        first_dt          = _ms_to_ist(first_ts_ms)
-        first_minute      = _floor_minute(first_dt)
-        if first_minute > session_start:
-            gap_start = session_start
-            gap_end   = min(first_minute, session_end)
-            if gap_start <= gap_end:
-                windows.append((gap_start, gap_end))
-
-    for event, ts_ms, _mode in events:
-        if event == "DISCONNECTED":
-            if pending_disconnect_ms is None:
-                pending_disconnect_ms = ts_ms
-        elif event in ("DAY_STARTED", "RECONNECTED"):
-            if pending_disconnect_ms is not None:
-                gap_start = _floor_minute(_ms_to_ist(pending_disconnect_ms))
-                gap_end   = _floor_minute(_ms_to_ist(ts_ms))
-                gap_start = max(gap_start, session_start)
-                gap_end   = min(gap_end, session_end)
-                if gap_start <= gap_end:
-                    windows.append((gap_start, gap_end))
-                pending_disconnect_ms = None
-
-    # trailing disconnect never followed by a reconnect in the log
-    if pending_disconnect_ms is not None:
-        gap_start = max(_floor_minute(_ms_to_ist(pending_disconnect_ms)), session_start)
-        gap_end   = session_end if day != now.date() else (_latest_completed_candle(now) or session_end)
-        if gap_start <= gap_end:
-            windows.append((gap_start, gap_end))
-
-    return windows
-
-
-def _find_symbol_gaps(
-    db_paths: List[Path],
-    symbol: str,
-    required_days: List[date],
-    pre_startup_ts: Optional[datetime],
-    now: datetime,
-    quote_output_dir: Optional[str] = None,
-    log_windows_cache: Optional[Dict[date, Optional[List[HistoryWindow]]]] = None,
-) -> List[HistoryWindow]:
-    """
-    Return every (start, end) window missing for this symbol.
-
-    Primary source — the connection log (DAY_STARTED / DISCONNECTED /
-    RECONNECTED / DAY_NOT_STARTED).  If the log has data for a day, its
-    windows are used directly and NO SQLite scan happens for that day —
-    clean days cost nothing, known outages are queued straight to fetch.
-
-    Fallback — for any day with no log data at all (log wasn't running,
-    or predates this feature), fall back to the second-level timestamp
-    scan of this symbol's own SQLite data, same as before.
-
-    `log_windows_cache` lets the caller compute each day's log windows once
-    and reuse them across all symbols, since log-derived windows are
-    system-wide (identical for every symbol on that day).
-    """
-    table = f"quote_{_safe_symbol(symbol)}"
-    gaps: List[HistoryWindow] = []
-    if log_windows_cache is None:
-        log_windows_cache = {}
-
-    for day in required_days:
-        if not is_trading_day(day):
-            continue
-
-        is_today = day == now.date()
-
-        if is_today:
-            if now.time() < MARKET_OPEN:
-                continue
-            session_end = _latest_completed_candle(now)
-            if session_end is None:
-                continue
-            session_start = _session_open(day)
-        else:
-            session_start = _session_open(day)
-            session_end   = _session_last_candle(day)
-
-        # ── try the connection log first (cached per day across symbols) ──
-        first_time_for_day = day not in log_windows_cache
-        if first_time_for_day:
-            log_windows_cache[day] = (
-                _day_windows_from_log(quote_output_dir, day, session_start, session_end, now)
-                if quote_output_dir else None
-            )
-        log_windows = log_windows_cache[day]
-
-        if log_windows is not None:
-            # Log-derived windows are system-wide (same outage applies to
-            # every symbol) — only print them the first time they're
-            # computed for this day, not once per symbol that reuses them.
-            if log_windows and first_time_for_day:
-                for g in log_windows:
-                    print(
-                        f"[BACKFILL] {day} LOG gap (all symbols): "
-                        f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
-                        flush=True,
-                    )
-            elif not log_windows and first_time_for_day:
-                # Log says "clean" — verify that's actually true before
-                # trusting it. See _day_has_any_data docstring for why.
-                if not _day_has_any_data(db_paths, day, session_start, session_end):
-                    print(
-                        f"[BACKFILL][WARN] {day} connection log reports a clean "
-                        "day, but zero rows exist for ANY symbol in that window "
-                        "— overriding to a full-day gap (likely a silent auth "
-                        "failure that never triggered a logged disconnect)",
-                        flush=True,
-                    )
-                    log_windows_cache[day] = [(session_start, session_end)]
-                    log_windows = log_windows_cache[day]
-            if log_windows:
-                gaps.extend(log_windows)
-            # else: log confirms a clean day — nothing to do, no scan needed
-            continue
-
-        # ── no log data for this day — fall back to the data scan ────────
-        timestamps = _get_timestamps_for_day(db_paths, table, day)
-
-        if not timestamps:
-            print(
-                f"[BACKFILL] {symbol} {day} — no data/log, fetching full session",
-                flush=True,
-            )
-            gaps.append((session_start, session_end))
-            continue
-
-        day_gaps = _second_level_gaps(timestamps, session_start, session_end)
-        if day_gaps:
-            for g in day_gaps:
-                print(
-                    f"[BACKFILL] {symbol} {day} SCAN gap: "
-                    f"{g[0].strftime('%H:%M')}→{g[1].strftime('%H:%M')}",
-                    flush=True,
-                )
-            gaps.extend(day_gaps)
-        else:
-            print(
-                f"[BACKFILL] {symbol} {day} — data complete, skipping",
-                flush=True,
-            )
-
-    return gaps
 
 
 # ---------------------------------------------------------------------------
@@ -602,91 +171,6 @@ def latest_collected_timestamp(quote_output_dir: str) -> Optional[datetime]:
             )
             return latest
     return None
-
-
-# ---------------------------------------------------------------------------
-# Historical PostgreSQL helpers
-# ---------------------------------------------------------------------------
-
-def _history_connection(dbname: str):
-    conn = psycopg2.connect(**_conn_params(dbname))
-    conn.autocommit = True
-    return conn
-
-
-def _history_table_exists(conn, table: str) -> bool:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s",
-        (table.lower(),),
-    )
-    return cur.fetchone() is not None
-
-
-def _history_timestamps_for_window(
-    conn,
-    table: str,
-    window_start: datetime,
-    window_end: datetime,
-) -> List[int]:
-    if not _history_table_exists(conn, table):
-        return []
-
-    start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
-    end_ms = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
-
-    cur = conn.cursor()
-    cur.execute(
-        f"SELECT timestamp FROM {table} WHERE timestamp >= %s AND timestamp <= %s",
-        (start_ms, end_ms),
-    )
-    timestamps: List[int] = []
-    for (raw_ts,) in cur.fetchall():
-        ts_ms = _to_ms(raw_ts)
-        if ts_ms is not None:
-            timestamps.append(ts_ms)
-    return sorted(set(timestamps))
-
-
-def _filter_gaps_already_in_history(
-    conn,
-    symbol: str,
-    exchange: str,
-    gaps: List[HistoryWindow],
-) -> Tuple[List[HistoryWindow], int, int]:
-    """
-    Returns (remaining_gaps, fully_present_count, partially_present_count).
-
-    Stays silent by design — with 100+ symbols this gets called once per
-    symbol per run, so printing here would flood the log. The caller
-    aggregates these counts into a single progress line + one summary.
-    """
-    table = f"quote_{_safe_symbol(symbol)}".lower()
-    remaining: List[HistoryWindow] = []
-    fully_present = 0
-    partially_present = 0
-
-    for window_start, window_end in gaps:
-        timestamps = _history_timestamps_for_window(
-            conn,
-            table,
-            window_start,
-            window_end,
-        )
-        if not timestamps:
-            remaining.append((window_start, window_end))
-            continue
-
-        missing_windows = _second_level_gaps(timestamps, window_start, window_end)
-        if not missing_windows:
-            fully_present += 1
-            continue
-
-        if missing_windows != [(window_start, window_end)]:
-            partially_present += 1
-        remaining.extend(missing_windows)
-
-    return remaining, fully_present, partially_present
 
 
 # ---------------------------------------------------------------------------
@@ -918,9 +402,9 @@ class BackfillManager:
 
                 checked += 1
                 _progress_write(
-                    f"[BACKFILL] checking history DB... {checked}/{total_symbols} symbols "
-                    f"| {fully_present_total} window(s) already present "
-                    f"| {partial_total} partial | {len(all_gaps)} symbol(s) need fetch",
+                    f"[BACKFILL] {checked}/{total_symbols} | {exchange}:{symbol} "
+                    f"| present={fully_present_total} partial={partial_total} "
+                    f"need={len(all_gaps)}",
                     index=checked,
                     total=total_symbols,
                 )
@@ -1115,3 +599,296 @@ class BackfillManager:
             flush=True,
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# DailyCloseManager
+# ---------------------------------------------------------------------------
+
+class DailyCloseManager:
+    """
+    Fetches the authoritative daily (1D / EOD) candle for each symbol right
+    after market close. The websocket only ever provides a live VWAP-based
+    price, never the broker's real, official close — this is the only way
+    to get the actual close price.
+
+    Writes the SAME candle to two places:
+      - PostgreSQL table daily_SYMBOL — one row per symbol per day, via a
+        dedicated PgWriter(table="daily", ...). Retained separately from
+        quote_/depth_ (see pg_writer.purge_old_data — 30 trading days by
+        default vs. 3 for tick data).
+      - The SAME SQLite quote_SYMBOL table live ticks already go into, as
+        ONE extra synthetic row per symbol per day. Tagged
+        "source": "daily_close" inside raw_json so it's unambiguous from a
+        real tick — anything reading that table can trivially tell them
+        apart, and nothing that assumes "every row is a live tick" (candle
+        generation, gap detection, etc.) is fooled into treating it as one.
+
+    Must be called BEFORE the live SQLite writer (OhlcParquetWriter) is
+    shut down for the session — pass its still-running instance in via
+    `ohlc_writer` so this can enqueue through it normally rather than
+    opening a second, competing connection to the same DB file.
+    """
+
+    def __init__(
+        self,
+        symbols: Sequence[dict],
+        api_key: str,
+        history_dbname: Optional[str] = None,
+        settle_delay_sec: float = 60.0,
+        flush_batch_size: int = 50,
+        flush_interval_sec: float = 1.0,
+    ):
+        self.symbols          = list(symbols)
+        self.api_key          = api_key
+        self.endpoint         = _history_endpoint()
+        self.history_dbname   = (
+            history_dbname
+            or os.getenv("PG_HDBNAME", "market_history").strip()
+            or "market_history"
+        )
+        # The broker may take a short while after 15:30 to finalize the
+        # day's daily candle — give it a head start before the first
+        # fetch attempt rather than hammering it with immediate retries.
+        self.settle_delay_sec = max(0.0, settle_delay_sec)
+        self.flush_batch_size = flush_batch_size
+        self.flush_interval_sec = flush_interval_sec
+
+    async def run(self, ohlc_writer, pg_configured: bool) -> None:
+        try:
+            if self.settle_delay_sec > 0:
+                print(
+                    f"[DAILY_CLOSE] waiting {self.settle_delay_sec:.0f}s for "
+                    f"broker to finalize today's daily candle",
+                    flush=True,
+                )
+                await asyncio.sleep(self.settle_delay_sec)
+            # blocking HTTP + SQLite/PG I/O — off the event loop, same as
+            # BackfillManager, so nothing else in the shutdown sequence stalls
+            await asyncio.to_thread(self._run_once, ohlc_writer, pg_configured)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[DAILY_CLOSE][ERROR] {exc}", flush=True)
+
+    def _run_once(self, ohlc_writer, pg_configured: bool) -> None:
+        pg_writer: Optional[PgWriter] = None
+        if pg_configured:
+            pg_writer = PgWriter(
+                table="daily",
+                dbname=self.history_dbname,
+                flush_batch_size=self.flush_batch_size,
+                flush_interval_sec=self.flush_interval_sec,
+                dedup_on_timestamp=True,
+            )
+
+        written, failed = 0, 0
+        total_symbols = len(self.symbols)
+        checked = 0
+        try:
+            for symbol_row in self.symbols:
+                symbol   = str(symbol_row["symbol"]).upper()
+                exchange = str(symbol_row.get("exchange") or "NSE").upper()
+                row = self._fetch_daily_close_row(symbol, exchange)
+                if row is None:
+                    failed += 1
+                else:
+                    if pg_writer is not None:
+                        pg_writer.enqueue(symbol, row)
+                    ohlc_writer.enqueue(symbol, row)
+                    written += 1
+
+                checked += 1
+                _progress_write(
+                    f"[DAILY_CLOSE] {checked}/{total_symbols} | {exchange}:{symbol} "
+                    f"| written={written} failed={failed}",
+                    index=checked,
+                    total=total_symbols,
+                )
+
+            _progress_done()
+            print(
+                f"[DAILY_CLOSE] wrote {written}/{len(self.symbols)} daily "
+                f"close(s){f', {failed} failed' if failed else ''}",
+                flush=True,
+            )
+        finally:
+            # flush inside this thread — join() never reaches the event loop,
+            # websocket/live writers are unaffected during this drain
+            if pg_writer is not None:
+                pg_writer.shutdown()
+
+    async def run_backfill(self, required_days: List[date]) -> None:
+        """
+        Catch-up path for the daily_SYMBOL tables — same idea as
+        BackfillManager's minute-level backfill, but for EOD candles.
+
+        Runs at process startup, independent of whether the market is open,
+        closed, or it's a weekend — these are always PAST trading days, so
+        the data is already finalized at the broker and fetchable any time,
+        unlike the live _run_once path above which only makes sense right
+        at today's close.
+        """
+        if not required_days:
+            return
+        try:
+            await asyncio.to_thread(self.backfill_missing_days, required_days)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[DAILY_CLOSE][BACKFILL][ERROR] {exc}", flush=True)
+
+    def backfill_missing_days(self, required_days: List[date]) -> None:
+        try:
+            conn = _history_connection(self.history_dbname)
+        except Exception as exc:
+            print(f"[DAILY_CLOSE][BACKFILL][ERROR] history db connect failed: {exc}", flush=True)
+            return
+
+        pg_writer = PgWriter(
+            table="daily",
+            dbname=self.history_dbname,
+            flush_batch_size=self.flush_batch_size,
+            flush_interval_sec=self.flush_interval_sec,
+            dedup_on_timestamp=True,
+        )
+
+        total_symbols = len(self.symbols)
+        checked = 0
+        written, present, failed = 0, 0, 0
+
+        try:
+            for symbol_row in self.symbols:
+                symbol   = str(symbol_row["symbol"]).upper()
+                exchange = str(symbol_row.get("exchange") or "NSE").upper()
+
+                missing_days = _missing_daily_days(conn, symbol, required_days)
+                present += len(required_days) - len(missing_days)
+
+                for day in missing_days:
+                    row = self._fetch_daily_close_row(
+                        symbol, exchange, day=day, source_tag="daily_close_backfill"
+                    )
+                    if row is None:
+                        failed += 1
+                        continue
+                    pg_writer.enqueue(symbol, row)
+                    written += 1
+
+                checked += 1
+                _progress_write(
+                    f"[DAILY_CLOSE][BACKFILL] {checked}/{total_symbols} | "
+                    f"{exchange}:{symbol} | written={written} present={present} "
+                    f"failed={failed}",
+                    index=checked,
+                    total=total_symbols,
+                )
+
+            _progress_done()
+            print(
+                f"[DAILY_CLOSE][BACKFILL] done — {written} written, {present} "
+                f"already present, {failed} failed "
+                f"({total_symbols} symbol(s) x {len(required_days)} day(s))",
+                flush=True,
+            )
+        finally:
+            pg_writer.shutdown()
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _fetch_daily_close_row(
+        self,
+        symbol: str,
+        exchange: str,
+        day: Optional[date] = None,
+        source_tag: str = "daily_close",
+    ) -> Optional[dict]:
+        day = day or now_kolkata().date()
+        body = {
+            "apikey":     self.api_key,
+            "symbol":     symbol,
+            "exchange":   exchange,
+            "interval":   "D",
+            "start_date": day.strftime("%Y-%m-%d"),
+            "end_date":   day.strftime("%Y-%m-%d"),
+            "source":     "api",
+        }
+        data = json.dumps(body).encode("utf-8")
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            http_request = request.Request(
+                self.endpoint,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with request.urlopen(http_request, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+                if attempt < max_attempts:
+                    print(
+                        f"[DAILY_CLOSE][WARN] fetch failed for {exchange}:{symbol} "
+                        f"{day} (attempt {attempt}/{max_attempts}): {exc}; "
+                        f"retrying in 2s",
+                        flush=True,
+                    )
+                    time.sleep(2)
+                    continue
+                print(
+                    f"[DAILY_CLOSE][WARN] fetch failed for {exchange}:{symbol} "
+                    f"{day}: {exc}",
+                    flush=True,
+                )
+                return None
+
+            rows = _extract_candle_rows(payload)
+            if not rows:
+                if attempt < max_attempts:
+                    print(
+                        f"[DAILY_CLOSE][WARN] no daily candle yet for "
+                        f"{exchange}:{symbol} {day} (attempt {attempt}/{max_attempts}); "
+                        f"retrying in 2s",
+                        flush=True,
+                    )
+                    time.sleep(2)
+                    continue
+                print(
+                    f"[DAILY_CLOSE][WARN] no daily candle returned for "
+                    f"{exchange}:{symbol} {day} after {max_attempts} attempts",
+                    flush=True,
+                )
+                return None
+
+            # Single-day request → normally exactly one row; if the API
+            # ever returns more, the last one is the authoritative EOD row.
+            candle = rows[-1]
+            normalized = _normalize_candle(candle, symbol, exchange, "D")
+            if normalized is None:
+                print(
+                    f"[DAILY_CLOSE][WARN] daily candle for {exchange}:{symbol} "
+                    f"{day} had no readable timestamp — skipping",
+                    flush=True,
+                )
+                return None
+
+            # The broker's own daily-candle timestamp convention is
+            # ambiguous (could be session open, midnight, etc.) — pin it
+            # explicitly to market close so it always sorts after every
+            # real tick that day and is unambiguous to any reader.
+            close_dt = datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata)
+            close_ms = int(close_dt.astimezone(timezone.utc).timestamp() * 1000)
+
+            payload_dict = json.loads(normalized["raw_json"])
+            payload_dict["timestamp"] = close_ms
+            payload_dict["source"] = source_tag
+            normalized["timestamp"] = close_dt.isoformat()
+            normalized["raw_json"] = json.dumps(
+                payload_dict, ensure_ascii=True, separators=(",", ":")
+            )
+            return normalized
+
+        return None

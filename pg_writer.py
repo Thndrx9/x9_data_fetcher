@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -61,6 +62,8 @@ from zoneinfo import ZoneInfo
 import psycopg2
 import psycopg2.extras
 import psycopg2.extensions
+
+from x9_data_fetcher.market_time import MARKET_OPEN, is_trading_day, now_kolkata, tz_kolkata
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -357,7 +360,7 @@ def _ensure_table(
     When dedup=True (history tables) adds UNIQUE(timestamp) so duplicate
     backfill runs are safe via ON CONFLICT DO NOTHING.
     """
-    table = f"{prefix}_{_safe_symbol(sym)}"
+    table = f"{prefix}_{_safe_symbol(sym)}".lower()
     if table in known_tables:
         return table
 
@@ -408,6 +411,140 @@ def _insert_sql(table: str, dedup: bool = False) -> str:
     return base + " ON CONFLICT (timestamp) DO NOTHING" if dedup else base
 
 
+# ---------------------------------------------------------------------------
+# Retention — delete data older than the last N trading days
+# ---------------------------------------------------------------------------
+#
+# Meant to be called once per trading day, right at market close, from
+# start_data.py's daily loop (see purge_old_data()).
+#
+# Cutoff definition: "older than the previous 3 trading days" = keep
+# everything from session-open (09:15 IST) of the 3rd-most-recent trading
+# day (inclusive) onward; delete anything before that. Today counts as one
+# of the 3 kept days once its session has started.
+#
+# Example, run at market close on a Wednesday with no holidays:
+#     kept days = Mon, Tue, Wed (today) → cutoff = Monday 09:15 IST
+#     deleted   = everything with timestamp < Monday 09:15 IST
+
+def _last_n_trading_days(reference, n: int) -> List:
+    result = []
+    cursor = reference.date()
+    for _ in range(n * 5):
+        if is_trading_day(cursor):
+            result.append(cursor)
+            if len(result) == n:
+                break
+        cursor -= timedelta(days=1)
+    return list(reversed(result))
+
+
+def _cutoff_ms(now=None, keep_trading_days: int = 3) -> int:
+    now = now or now_kolkata()
+    kept_days = _last_n_trading_days(now, keep_trading_days)
+    oldest_kept_day = kept_days[0]
+    cutoff_dt = datetime.combine(oldest_kept_day, MARKET_OPEN, tzinfo=tz_kolkata)
+    return int(cutoff_dt.timestamp() * 1000)
+
+
+def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str) -> None:
+    tag = f"[RETENTION:{dbname}]"
+    try:
+        conn = psycopg2.connect(**_conn_params(dbname))
+    except Exception as exc:
+        print(f"{tag}[ERROR] connect failed: {exc}", flush=True)
+        return
+
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        where_clause = " OR ".join(["tablename LIKE %s"] * len(table_patterns))
+        cur.execute(
+            f"SELECT tablename FROM pg_tables "
+            f"WHERE schemaname='public' AND ({where_clause})",
+            table_patterns,
+        )
+        tables = [row[0] for row in cur.fetchall()]
+
+        if not tables:
+            print(f"{tag} no {label} tables found — nothing to purge", flush=True)
+            return
+
+        total_deleted = 0
+        tables_affected = 0
+        for table in tables:
+            try:
+                cur.execute(f"DELETE FROM {table} WHERE timestamp < %s", (cutoff_ms,))
+                deleted = cur.rowcount
+                if deleted:
+                    tables_affected += 1
+                    total_deleted += deleted
+            except Exception as exc:
+                print(f"{tag}[ERROR] delete failed for {table}: {exc}", flush=True)
+                conn.rollback()
+                cur = conn.cursor()  # cursor is dead after rollback — get a fresh one
+                continue
+
+        conn.commit()
+        print(
+            f"{tag} {label}: purged {total_deleted} row(s) across "
+            f"{tables_affected}/{len(tables)} table(s) (cutoff={cutoff_ms})",
+            flush=True,
+        )
+
+        # VACUUM reclaims disk space after large deletes, but can't run
+        # inside a transaction block — needs its own autocommit connection.
+        if total_deleted:
+            conn.autocommit = True
+            vac_cur = conn.cursor()
+            for table in tables:
+                try:
+                    vac_cur.execute(f"VACUUM {table}")
+                except Exception as exc:
+                    print(f"{tag}[WARN] vacuum failed for {table}: {exc}", flush=True)
+            print(f"{tag} {label}: vacuum complete", flush=True)
+
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def purge_old_data(
+    keep_trading_days: int = 3,
+    keep_daily_trading_days: int = 30,
+    now=None,
+) -> None:
+    """
+    Delete old rows from every configured database (live + history):
+      - quote_*/depth_* (tick data)  → keep last `keep_trading_days` trading days
+      - daily_*         (EOD candle) → keep last `keep_daily_trading_days` trading days
+
+    Two separate retention windows because daily_* holds one tiny row per
+    symbol per day — cheap to keep much longer, and useful for historical
+    close-price reference — while quote_/depth_ hold every tick and would
+    grow unbounded if kept anywhere near that long.
+
+    Safe to call even if PostgreSQL isn't configured/reachable — logs and
+    returns rather than raising, so it can't take down the daily loop.
+    """
+    start = time.monotonic()
+    now = now or now_kolkata()
+    tick_cutoff_ms  = _cutoff_ms(now, keep_trading_days)
+    daily_cutoff_ms = _cutoff_ms(now, keep_daily_trading_days)
+    print(
+        f"[RETENTION] starting purge — tick data: last {keep_trading_days} "
+        f"trading day(s) (cutoff={tick_cutoff_ms}), daily candles: last "
+        f"{keep_daily_trading_days} trading day(s) (cutoff={daily_cutoff_ms})",
+        flush=True,
+    )
+    for dbname in _configured_dbnames():
+        _purge_db(dbname, ["quote_%", "depth_%"], tick_cutoff_ms, "tick data")
+        _purge_db(dbname, ["daily_%"], daily_cutoff_ms, "daily candles")
+    print(f"[RETENTION] done in {time.monotonic() - start:.1f}s", flush=True)
+
+
 def _parse(row: dict) -> tuple:
     raw       = row.get("raw_json", "{}")
     d         = json.loads(raw) if isinstance(raw, str) else raw
@@ -451,8 +588,8 @@ class PgWriter:
         flush_interval_sec: float = 1.0,
         dedup_on_timestamp: bool = False,
     ):
-        if table not in ("depth", "quote"):
-            raise ValueError("table must be 'depth' or 'quote'")
+        if table not in ("depth", "quote", "daily"):
+            raise ValueError("table must be 'depth', 'quote', or 'daily'")
 
         self.table  = table
         self._tag   = f"[PG_{table.upper()}]"

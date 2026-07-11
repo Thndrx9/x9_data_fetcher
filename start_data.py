@@ -18,7 +18,9 @@ create_and_activate_venv()
 
 from x9_data_fetcher.backfill_manager import (
     BackfillManager,
+    DailyCloseManager,
     latest_collected_timestamp,
+    _last_n_trading_days,
     _previous_trading_day,
 )
 from x9_data_fetcher import connection_log
@@ -32,7 +34,7 @@ from x9_data_fetcher.market_time import (
     seconds_until_pre_connect,
 )
 from x9_data_fetcher.symbols import load_symbols
-from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup
+from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup, purge_old_data
 from x9_data_fetcher.websocket_connect import websocket_client
 
 
@@ -151,6 +153,7 @@ async def run_engine():
     # ── Startup backfill — fires immediately at script launch, independent of
     #    session schedule.  Recovers past days without waiting for 09:14. ──
     startup_backfill_task = None
+    daily_backfill_task = None
     if backfill_enabled and pg_configured:
         pre_startup_ts = latest_collected_timestamp(quote_output_dir)
         startup_backfill_task = asyncio.create_task(
@@ -164,6 +167,22 @@ async def run_engine():
             ).run()
         )
         print("[X9_FETCHER] Startup backfill task launched", flush=True)
+
+        # Same idea, EOD candle timeframe — daily_SYMBOL only gets written
+        # at 15:30 close, so if the process was off/down at that moment
+        # (weekend startup, downtime, restart), this catches it up. Works
+        # regardless of market/weekend status since it only ever looks at
+        # already-finalized past trading days.
+        _daily_min_days = max(
+            3, int(os.getenv("X9_BACKFILL_MIN_DAYS", "3").strip() or "3")
+        )
+        _daily_required_days = _last_n_trading_days(now_kolkata(), _daily_min_days)
+        daily_backfill_task = asyncio.create_task(
+            DailyCloseManager(symbols=symbols, api_key=api_key).run_backfill(
+                _daily_required_days
+            )
+        )
+        print("[X9_FETCHER] Startup daily-candle backfill task launched", flush=True)
     elif backfill_enabled:
         print("[BACKFILL] startup backfill skipped — PostgreSQL not configured", flush=True)
 
@@ -288,13 +307,30 @@ async def run_engine():
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, close_task, return_exceptions=True)
+
+        # ── Daily close price — must run BEFORE fetcher.shutdown() so it
+        #    can enqueue through the still-running ohlc_writer (same
+        #    quote_SYMBOL SQLite table live ticks go into). Natural close
+        #    only — a manual stop mid-session has no real close price yet.
+        if session_stop.is_set() and not manual_stop.is_set():
+            try:
+                await DailyCloseManager(
+                    symbols=symbols,
+                    api_key=api_key,
+                ).run(fetcher.ohlc_writer, pg_configured)
+            except Exception as exc:
+                print(f"[DAILY_CLOSE][ERROR] {exc}", flush=True)
+
         fetcher.shutdown()
 
         if manual_stop.is_set():
-            # Cancel startup backfill if it's still running
+            # Cancel startup backfill tasks if still running
             if startup_backfill_task and not startup_backfill_task.done():
                 startup_backfill_task.cancel()
                 await asyncio.gather(startup_backfill_task, return_exceptions=True)
+            if daily_backfill_task and not daily_backfill_task.done():
+                daily_backfill_task.cancel()
+                await asyncio.gather(daily_backfill_task, return_exceptions=True)
             print("[X9_FETCHER] Manual shutdown complete", flush=True)
             break
 
@@ -302,6 +338,15 @@ async def run_engine():
             "[X9_FETCHER] Market closed at 15:30. Session ended, data flushed.",
             flush=True,
         )
+
+        # ── Daily retention purge — runs once per trading day at market
+        #    close. Blocking psycopg2 calls, so offload to a thread rather
+        #    than stalling the event loop / next session's pre-connect wait.
+        if pg_configured:
+            try:
+                await asyncio.to_thread(purge_old_data)
+            except Exception as exc:
+                print(f"[RETENTION][ERROR] purge failed: {exc}", flush=True)
         # Loop back → will calculate wait until next 9:14 (skipping weekends)
 
 
