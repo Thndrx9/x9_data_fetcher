@@ -30,6 +30,7 @@ from x9_data_fetcher.market_time import (
     now_kolkata,
     tz_kolkata,
 )
+from x9_data_fetcher import pg_writer as _pg_writer_module
 from x9_data_fetcher.pg_writer import PgWriter
 
 
@@ -80,22 +81,33 @@ def _progress_write(text: str, *, index: Optional[int] = None, total: Optional[i
         max_len = max(width - 1, 1)
         if len(text) > max_len:
             text = text[: max_len - 1] + "…"
-        sys.stdout.write(f"\r{text}\033[K")
-        sys.stdout.flush()
+        # Shared with pg_writer._safe_print: any background writer-thread
+        # print (table creation, insert errors, etc.) checks this same lock
+        # + flag before printing, and closes this line with a newline first
+        # if it's open — otherwise their print lands mid-line and garbles
+        # the display (e.g. "...failed=0[PG_DAILY] new table: ..." smashed
+        # onto one line, exactly as seen in production).
+        with _pg_writer_module._console_lock:
+            sys.stdout.write(f"\r{text}\033[K")
+            sys.stdout.flush()
+            _pg_writer_module._progress_open = True
         return
 
     if index is None or total is None:
         return
 
     if index == 1 or index == total or index % _NON_TTY_PROGRESS_INTERVAL == 0:
-        print(text, flush=True)
+        with _pg_writer_module._console_lock:
+            print(text, flush=True)
 
 
 def _progress_done() -> None:
     """Finalize the current progress line so the next print starts fresh."""
     if _IS_TTY:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        with _pg_writer_module._console_lock:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            _pg_writer_module._progress_open = False
     # non-tty: nothing to finalize — periodic plain lines already have newlines
 
 

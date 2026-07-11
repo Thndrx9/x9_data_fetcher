@@ -173,8 +173,15 @@ async def run_engine():
         # (weekend startup, downtime, restart), this catches it up. Works
         # regardless of market/weekend status since it only ever looks at
         # already-finalized past trading days.
+        #
+        # Own env var, own default — matches the 30-trading-day retention
+        # window in pg_writer.purge_old_data (keep_daily_trading_days),
+        # NOT the 3-day X9_BACKFILL_MIN_DAYS used for tick-level backfill.
+        # Otherwise retention would happily hold 30 days of daily closes
+        # while backfill only ever catches up the last 3 — days 4-30 of
+        # any real downtime would silently never get filled in.
         _daily_min_days = max(
-            3, int(os.getenv("X9_BACKFILL_MIN_DAYS", "3").strip() or "3")
+            1, int(os.getenv("X9_DAILY_BACKFILL_DAYS", "30").strip() or "30")
         )
         _daily_required_days = _last_n_trading_days(now_kolkata(), _daily_min_days)
         daily_backfill_task = asyncio.create_task(
