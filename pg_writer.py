@@ -127,12 +127,27 @@ def _quote_ident(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def _conn_params(dbname: Optional[str] = None) -> dict:
+def _conn_params(dbname: Optional[str] = None, statement_timeout_sec: Optional[int] = None) -> dict:
     """
     Return connection params as a dict — never as a DSN string.
     DSN strings treat # as a comment character which breaks passwords like Thnd@9#
     Using keyword args bypasses all DSN string parsing entirely.
+
+    statement_timeout_sec lets a caller override the default tight timeout.
+    The default (PG_STATEMENT_TIMEOUT_SEC, 10s) is sized for the live tick
+    write path, where a normal INSERT/COMMIT takes milliseconds — 10s is
+    already generous there, and the whole point is to bound how long a
+    stuck writer thread can block shutdown. A retention purge is a
+    different kind of operation: a DELETE spanning weeks of backlog across
+    hundreds of thousands of rows can legitimately take well over 10s, so
+    it needs its own, much longer budget rather than inheriting the live
+    write path's tight limit.
     """
+    timeout_sec = (
+        statement_timeout_sec
+        if statement_timeout_sec is not None
+        else int(os.getenv("PG_STATEMENT_TIMEOUT_SEC", "10"))
+    )
     return {
         "host":     os.getenv("PG_HOST",     "localhost"),
         "port":     int(os.getenv("PG_PORT", "5432")),
@@ -147,7 +162,7 @@ def _conn_params(dbname: Optional[str] = None) -> dict:
         # server can leave the writer thread blocked inside execute()/
         # commit() with no way to notice _stop was set — which is what
         # makes shutdown() hang forever on thread.join().
-        "options": f"-c statement_timeout={int(os.getenv('PG_STATEMENT_TIMEOUT_SEC', '10')) * 1000}",
+        "options": f"-c statement_timeout={timeout_sec * 1000}",
     }
 
 
@@ -489,8 +504,15 @@ def _cutoff_ms(now=None, keep_trading_days: int = 3) -> int:
 
 def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str) -> None:
     tag = f"[RETENTION:{dbname}]"
+    # Purge-specific timeout: deletes/vacuums across a large backlog can
+    # legitimately take minutes, especially on a table that's never been
+    # purged before. PG_PURGE_STATEMENT_TIMEOUT_SEC defaults to 300s (5 min)
+    # -- far longer than the 10s used for live tick writes, since a slow
+    # purge just delays that day's cleanup, it doesn't risk hanging the
+    # live process the way a stuck write-path connection would.
+    purge_timeout_sec = int(os.getenv("PG_PURGE_STATEMENT_TIMEOUT_SEC", "300"))
     try:
-        conn = psycopg2.connect(**_conn_params(dbname))
+        conn = psycopg2.connect(**_conn_params(dbname, statement_timeout_sec=purge_timeout_sec))
     except Exception as exc:
         _safe_print(f"{tag}[ERROR] connect failed: {exc}")
         return
