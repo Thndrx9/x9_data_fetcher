@@ -20,12 +20,23 @@ After first successful setup, all setup steps are skipped instantly on restart.
     PG_DBNAME    = market
     PG_HDBNAME   = market_history
 
-Table layout (matches SQLite writers exactly — one table per symbol)
+Table layout (one table per symbol; quote/depth use typed columns, NOT
+JSONB — real-data measurements showed ~85%/~72.8% size reduction vs. a
+JSONB blob. 'daily' candle-history tables are unchanged/legacy JSONB.)
 ---------------------------------------------------------------------
     depth_RELIANCE, depth_TCS, depth_WIPRO ...
-    quote_RELIANCE, quote_TCS, quote_WIPRO ...
+        timestamp, ingest_ns, ltp, volume, last_quantity, oi,
+        upper_circuit, lower_circuit,
+        buy0_price, buy0_qty, buy0_orders, ... buy4_*,
+        sell0_price, sell0_qty, sell0_orders, ... sell4_*
 
-    Each table: timestamp BIGINT | ingest_ns BIGINT | raw_json JSONB
+    quote_RELIANCE, quote_TCS, quote_WIPRO ...
+        timestamp, ingest_ns, ltp, ltt, volume, open, high, low, close,
+        last_quantity, oi, upper_circuit, lower_circuit
+
+    (symbol/exchange/mode are NOT stored as columns — 100% redundant
+    with the table name itself, since each table only ever holds one
+    symbol's own ticks.)
 
 Query from local PC (DBeaver / psql)
 --------------------------------------
@@ -33,13 +44,14 @@ Query from local PC (DBeaver / psql)
     SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename;
 
     -- last 100 ticks for one symbol
-    SELECT timestamp, raw_json FROM depth_RELIANCE ORDER BY timestamp DESC LIMIT 100;
+    SELECT * FROM depth_RELIANCE ORDER BY timestamp DESC LIMIT 100;
 
-    -- query a field inside raw_json (JSONB advantage)
-    SELECT timestamp, raw_json->>'ltp' AS ltp FROM quote_RELIANCE ORDER BY timestamp DESC LIMIT 100;
+    -- top-of-book only
+    SELECT timestamp, ltp, buy0_price, buy0_qty, sell0_price, sell0_qty
+    FROM depth_RELIANCE ORDER BY timestamp DESC LIMIT 100;
 
     -- fetch missed gap after local internet dropout
-    SELECT timestamp, ingest_ns, raw_json
+    SELECT *
     FROM depth_RELIANCE
     WHERE timestamp BETWEEN <dropout_ms> AND <reconnect_ms>
     ORDER BY timestamp;
@@ -414,22 +426,77 @@ def _ensure_table(
 ) -> str:
     """
     Create depth_SYMBOL or quote_SYMBOL on first tick for that symbol.
-    Matches SQLite schema: timestamp BIGINT | ingest_ns BIGINT | raw_json JSONB.
-    When dedup=True (history tables) adds UNIQUE(timestamp) so duplicate
-    backfill runs are safe via ON CONFLICT DO NOTHING.
+
+    quote/depth use typed columns (not JSONB) — real-data measurements
+    showed ~85% (quote) and ~72.8% (depth) size reduction vs. the JSONB
+    blob approach. symbol/exchange/mode are deliberately NOT stored as
+    columns: they're 100% redundant with the table name itself (this
+    table only ever holds SYM's own ticks), so storing them per-row would
+    be pure waste. oi/upper_circuit/lower_circuit ARE kept in both quote
+    and depth tables on purpose — checked earlier and found NOT reliably
+    duplicated between the two (~71.6% match, not the clean 100% we
+    confirmed for the embedded depth object), so dropping them from
+    either table risks losing real information for a few bytes' saving.
+
+    'daily' (candle history) intentionally stays on the old JSONB schema —
+    it wasn't part of the measured/agreed typed-columns scope, and touching
+    it isn't worth the added risk for a table that isn't the size problem.
     """
     table = f"{prefix}_{_safe_symbol(sym)}".lower()
     if table in known_tables:
         return table
 
     cur = conn.cursor()
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            timestamp  BIGINT NOT NULL,
-            ingest_ns  BIGINT,
-            raw_json   JSONB  NOT NULL
+
+    if prefix == "quote":
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                timestamp       BIGINT NOT NULL,
+                ingest_ns       BIGINT,
+                ltp             DOUBLE PRECISION,
+                ltt             BIGINT,
+                volume          BIGINT,
+                open            DOUBLE PRECISION,
+                high            DOUBLE PRECISION,
+                low             DOUBLE PRECISION,
+                close           DOUBLE PRECISION,
+                last_quantity   BIGINT,
+                oi              BIGINT,
+                upper_circuit   DOUBLE PRECISION,
+                lower_circuit   DOUBLE PRECISION
+            )
+        """)
+    elif prefix == "depth":
+        level_cols = ",\n                ".join(
+            f"{side}{lvl}_price DOUBLE PRECISION, "
+            f"{side}{lvl}_qty BIGINT, "
+            f"{side}{lvl}_orders BIGINT"
+            for side in ("buy", "sell")
+            for lvl in range(5)
         )
-    """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                timestamp       BIGINT NOT NULL,
+                ingest_ns       BIGINT,
+                ltp             DOUBLE PRECISION,
+                volume          BIGINT,
+                last_quantity   BIGINT,
+                oi              BIGINT,
+                upper_circuit   DOUBLE PRECISION,
+                lower_circuit   DOUBLE PRECISION,
+                {level_cols}
+            )
+        """)
+    else:
+        # 'daily' and anything else: unchanged legacy JSONB schema
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                timestamp  BIGINT NOT NULL,
+                ingest_ns  BIGINT,
+                raw_json   JSONB  NOT NULL
+            )
+        """)
+
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (timestamp)"
     )
@@ -460,9 +527,33 @@ def _load_existing_tables(
     return tables
 
 
+_QUOTE_COLUMNS = (
+    "timestamp", "ingest_ns", "ltp", "ltt", "volume", "open", "high", "low",
+    "close", "last_quantity", "oi", "upper_circuit", "lower_circuit",
+)
+
+_DEPTH_COLUMNS = (
+    "timestamp", "ingest_ns", "ltp", "volume", "last_quantity", "oi",
+    "upper_circuit", "lower_circuit",
+) + tuple(
+    f"{side}{lvl}_{field}"
+    for side in ("buy", "sell")
+    for lvl in range(5)
+    for field in ("price", "qty", "orders")
+)
+
+
 @lru_cache(maxsize=512)
-def _insert_sql(table: str, dedup: bool = False) -> str:
-    base = f"INSERT INTO {table} (timestamp, ingest_ns, raw_json) VALUES %s"
+def _insert_sql(table: str, prefix: str, dedup: bool = False) -> str:
+    if prefix == "quote":
+        columns = _QUOTE_COLUMNS
+    elif prefix == "depth":
+        columns = _DEPTH_COLUMNS
+    else:
+        columns = ("timestamp", "ingest_ns", "raw_json")
+
+    col_list = ", ".join(columns)
+    base = f"INSERT INTO {table} ({col_list}) VALUES %s"
     return base + " ON CONFLICT (timestamp) DO NOTHING" if dedup else base
 
 
@@ -617,11 +708,48 @@ def purge_old_data(
     _safe_print(f"[RETENTION] done in {time.monotonic() - start:.1f}s")
 
 
-def _parse(row: dict) -> tuple:
-    raw       = row.get("raw_json", "{}")
-    d         = json.loads(raw) if isinstance(raw, str) else raw
-    ts_ms     = d.get("timestamp")
+def _parse(row: dict, prefix: str) -> tuple:
+    raw = row.get("raw_json", "{}")
+    d = json.loads(raw) if isinstance(raw, str) else (raw or {})
     ingest_ns = row.get("ingest_ns")
+    ts_ms = d.get("timestamp")
+
+    if prefix == "quote":
+        return (
+            ts_ms, ingest_ns,
+            d.get("ltp"), d.get("ltt"), d.get("volume"),
+            d.get("open"), d.get("high"), d.get("low"), d.get("close"),
+            d.get("last_quantity"), d.get("oi"),
+            d.get("upper_circuit"), d.get("lower_circuit"),
+        )
+
+    if prefix == "depth":
+        depth = d.get("depth") or {}
+        buy = depth.get("buy") or []
+        sell = depth.get("sell") or []
+
+        def level(levels, i, field):
+            # tolerate thin books with fewer than 5 real levels — store
+            # NULL rather than erroring or fabricating a fake 0
+            if i < len(levels) and isinstance(levels[i], dict):
+                return levels[i].get(field)
+            return None
+
+        level_values = []
+        for side_levels in (buy, sell):
+            for i in range(5):
+                level_values.append(level(side_levels, i, "price"))
+                level_values.append(level(side_levels, i, "quantity"))
+                level_values.append(level(side_levels, i, "orders"))
+
+        return (
+            ts_ms, ingest_ns,
+            d.get("ltp"), d.get("volume"), d.get("last_quantity"), d.get("oi"),
+            d.get("upper_circuit"), d.get("lower_circuit"),
+            *level_values,
+        )
+
+    # legacy path ('daily' and anything else): unchanged JSONB blob
     return (
         ts_ms,
         ingest_ns,
@@ -880,7 +1008,7 @@ class PgWriter:
                 buffered[sym] = _cap_retry_rows(sym, rows, self._tag)
                 continue
 
-            sql = _insert_sql(table, self._dedup)
+            sql = _insert_sql(table, self.table, self._dedup)
 
             # keep parsed rows paired with their original raw row so a failed
             # insert can put the *raw* row back for retry (parsing is cheap
@@ -890,7 +1018,7 @@ class PgWriter:
             bad_count = 0
             for row in rows:
                 try:
-                    good_parsed.append(_parse(row))
+                    good_parsed.append(_parse(row, self.table))
                     good_raw.append(row)
                 except Exception as exc:
                     bad_count += 1

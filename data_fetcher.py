@@ -70,12 +70,20 @@ def _extract_quote_row(message: Dict[str, Any]) -> Dict[str, Any] | None:
     if not symbol or not exchange or ltp is None:
         return None
 
+    # Quote-mode packets from this broker carry a full order-book "depth"
+    # snapshot alongside the quote fields (ltp/ohlc/oi/etc). Confirmed via
+    # direct comparison against the dedicated depth feed that this embedded
+    # depth is a 100% exact duplicate of what depth_<symbol> already stores
+    # with proper fidelity — so it's dropped here rather than storing the
+    # same order-book data twice under two different table names.
+    clean = {k: v for k, v in inner.items() if k != "depth"}
+
     return {
         "timestamp": _to_iso_ts(inner.get("ltt") or inner.get("timestamp")),
         "ingest_ns": time.time_ns(),
         "exchange": str(exchange).upper(),
         "symbol": str(symbol).upper(),
-        "raw_json": json.dumps(inner, ensure_ascii=True),
+        "raw_json": json.dumps(clean, ensure_ascii=True),
     }
 
 
