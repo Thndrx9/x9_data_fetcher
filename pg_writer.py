@@ -585,7 +585,13 @@ def _last_n_trading_days(reference, n: int) -> List:
     return list(reversed(result))
 
 
-def _cutoff_ms(now=None, keep_trading_days: int = 3) -> int:
+LIVE_TICK_RETENTION_TRADING_DAYS = 3  # default for purge_old_data's keep_trading_days;
+# also the ceiling backfill_manager.min_days must not exceed (see BackfillManager
+# guard) — if backfill looks back further than PG actually retains, gap-detection
+# would silently mistake purged history for missing history.
+
+
+def _cutoff_ms(now=None, keep_trading_days: int = LIVE_TICK_RETENTION_TRADING_DAYS) -> int:
     now = now or now_kolkata()
     kept_days = _last_n_trading_days(now, keep_trading_days)
     oldest_kept_day = kept_days[0]
@@ -664,7 +670,7 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
 
 
 def purge_old_data(
-    keep_trading_days: int = 3,
+    keep_trading_days: int = LIVE_TICK_RETENTION_TRADING_DAYS,
     keep_daily_trading_days: Optional[int] = None,
     now=None,
 ) -> None:
@@ -706,6 +712,102 @@ def purge_old_data(
         _purge_db(dbname, ["quote_%", "depth_%"], tick_cutoff_ms, "tick data")
         _purge_db(dbname, ["daily_%"], daily_cutoff_ms, "daily candles")
     _safe_print(f"[RETENTION] done in {time.monotonic() - start:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# Live-DB read helpers — historical lookback against the LIVE tick database
+# (PG_DBNAME, default 'market'), which mirrors what used to be scattered
+# across local market_*.db SQLite files written by data_fetcher.py's
+# PgWriter. These replace gap_detector.py's SQLite-file scanning now that
+# hourly rollover deletes each local file shortly after archiving it —
+# PG already retains the same multi-day window (LIVE_TICK_RETENTION_TRADING_DAYS)
+# that backfill's lookback needs, so it's the new source of truth instead.
+#
+# Callers open one connection per run (see BackfillManager._run_once) and
+# pass it in, rather than each helper opening its own — same convention as
+# _history_connection/_filter_gaps_already_in_history's history-DB helpers.
+# ---------------------------------------------------------------------------
+
+def live_connection(dbname: Optional[str] = None):
+    """Open a connection to the live tick database (default PG_DBNAME)."""
+    conn = psycopg2.connect(**_conn_params(dbname))
+    conn.autocommit = True
+    return conn
+
+
+def live_quote_tables(conn) -> List[str]:
+    """Every quote_* table currently in the live DB."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT tablename FROM pg_tables "
+        "WHERE schemaname='public' AND tablename LIKE 'quote_%'"
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
+def live_latest_quote_timestamp(conn) -> Optional[int]:
+    """
+    MAX(timestamp), in ms, across every quote_* table in the live DB.
+
+    Replaces the old latest_collected_timestamp() SQLite scan — same
+    "most recent tick collected, across all symbols" semantics used to
+    find the pre-startup resume point.
+    """
+    latest: Optional[int] = None
+    for table in live_quote_tables(conn):
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT MAX(timestamp) FROM {table}")
+            row = cur.fetchone()
+            ts_ms = row[0] if row else None
+            if ts_ms is not None and (latest is None or ts_ms > latest):
+                latest = ts_ms
+        except Exception as exc:
+            _safe_print(f"[LIVE_READ][WARN] failed reading {table}: {exc}")
+    return latest
+
+
+def live_timestamps_for_range(conn, table: str, start_ms: int, end_ms: int) -> List[int]:
+    """
+    Every raw tick timestamp (ms) in `table` within [start_ms, end_ms).
+
+    Replaces gap_detector._get_timestamps_for_day's multi-file SQLite scan
+    for one symbol/day. `table` is matched case-insensitively against the
+    lowercase name PG actually stores (_ensure_table always lowercases).
+    """
+    table = table.lower()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s",
+        (table,),
+    )
+    if cur.fetchone() is None:
+        return []
+    cur.execute(
+        f"SELECT timestamp FROM {table} WHERE timestamp >= %s AND timestamp < %s",
+        (start_ms, end_ms),
+    )
+    return sorted({row[0] for row in cur.fetchall() if row[0] is not None})
+
+
+def live_any_row_in_range(conn, start_ms: int, end_ms: int) -> bool:
+    """
+    True if any quote_* table in the live DB has at least one row in
+    [start_ms, end_ms). Replaces gap_detector._day_has_any_data's
+    "confirm at least one row landed somewhere" sanity check.
+    """
+    for table in live_quote_tables(conn):
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT 1 FROM {table} WHERE timestamp >= %s AND timestamp < %s LIMIT 1",
+                (start_ms, end_ms),
+            )
+            if cur.fetchone():
+                return True
+        except Exception as exc:
+            _safe_print(f"[LIVE_READ][WARN] failed reading {table}: {exc}")
+    return False
 
 
 def _parse(row: dict, prefix: str) -> tuple:
