@@ -8,9 +8,7 @@ backfill_manager.py's job — it calls into this module, then acts on the
 result.
 """
 
-import sqlite3
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
@@ -22,7 +20,11 @@ from x9_data_fetcher.market_time import (
     is_trading_day,
     tz_kolkata,
 )
-from x9_data_fetcher.pg_writer import _conn_params
+from x9_data_fetcher.pg_writer import (
+    _conn_params,
+    live_any_row_in_range,
+    live_timestamps_for_range,
+)
 
 
 HistoryWindow = Tuple[datetime, datetime]
@@ -135,101 +137,12 @@ def _last_n_trading_days(reference: datetime, n: int) -> List[date]:
     return list(reversed(result))   # oldest -> newest
 
 
-def _candidate_db_paths(base_dir: Path) -> List[Path]:
-    return sorted(base_dir.glob("market_*.db"), key=lambda p: p.name, reverse=True)
-
-
-# ---------------------------------------------------------------------------
-# SQLite scanning
-# ---------------------------------------------------------------------------
-
-def _get_timestamps_for_day(
-    db_paths: List[Path], table: str, day: date
-) -> List[int]:
-    """
-    Pull every raw timestamp (ms) stored for *symbol* on *day* across all
-    SQLite DB files.  Returns a sorted, deduplicated list.
-    """
-    day_start_ms = int(
-        datetime.combine(day, MARKET_OPEN, tzinfo=tz_kolkata).timestamp() * 1000
-    )
-    day_end_ms = int(
-        datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata).timestamp() * 1000
-    )
-    timestamps: List[int] = []
-
-    for db_path in db_paths:
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                cur = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                    (table,),
-                )
-                if not cur.fetchone():
-                    continue
-                cur = conn.execute(
-                    f"SELECT timestamp FROM {table} "
-                    f"WHERE timestamp >= ? AND timestamp < ?",
-                    (day_start_ms, day_end_ms),
-                )
-                for (raw_ts,) in cur.fetchall():
-                    ts_ms = _to_ms(raw_ts)
-                    if ts_ms is not None:
-                        timestamps.append(ts_ms)
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
-            print(f"[GAP_DETECTOR][WARN] error reading {db_path.name}: {exc}", flush=True)
-
-    return sorted(set(timestamps))
-
-
-def _day_has_any_data(
-    db_paths: List[Path], day: date, session_start: datetime, session_end: datetime
-) -> bool:
-    """
-    Belt-and-suspenders check for the log-based fast path.
-
-    The connection log only tracks socket-level connect/disconnect state.
-    If auth is silently rejected in a way that doesn't close the socket
-    (or a token expires mid-session without a clean disconnect), the log
-    can say "clean day" while zero real ticks ever arrived. Before trusting
-    a "clean" verdict from the log, confirm at least one row landed
-    *somewhere* (any symbol) during the session window that day. This is
-    one cheap query per day, not per symbol, so it doesn't undo the
-    performance benefit of the log-based fast path.
-    """
-    day_start_ms = int(session_start.timestamp() * 1000)
-    day_end_ms   = int(session_end.timestamp() * 1000)
-
-    for db_path in db_paths:
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                cur = conn.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type='table' AND name LIKE 'quote_%'"
-                )
-                tables = [row[0] for row in cur.fetchall()]
-                for table in tables:
-                    cur = conn.execute(
-                        f"SELECT 1 FROM {table} "
-                        f"WHERE timestamp >= ? AND timestamp < ? LIMIT 1",
-                        (day_start_ms, day_end_ms),
-                    )
-                    if cur.fetchone():
-                        return True
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
-            print(
-                f"[GAP_DETECTOR][WARN] error during day-data sanity check on "
-                f"{db_path.name}: {exc}",
-                flush=True,
-            )
-
-    return False
+# NOTE: local SQLite scanning (_candidate_db_paths, _get_timestamps_for_day,
+# _day_has_any_data) was removed here — hourly rollover now deletes each
+# local market_*.db file shortly after archiving it, so historical lookback
+# reads from the live PostgreSQL DB instead (see pg_writer.live_timestamps_for_range
+# and pg_writer.live_any_row_in_range). Old version is in git history if ever
+# needed for reference.
 
 
 def _second_level_gaps(
@@ -371,7 +284,7 @@ def _day_windows_from_log(
 
 
 def _find_symbol_gaps(
-    db_paths: List[Path],
+    live_conn,
     symbol: str,
     required_days: List[date],
     pre_startup_ts: Optional[datetime],
@@ -384,12 +297,12 @@ def _find_symbol_gaps(
 
     Primary source - the connection log (DAY_STARTED / DISCONNECTED /
     RECONNECTED / DAY_NOT_STARTED).  If the log has data for a day, its
-    windows are used directly and NO SQLite scan happens for that day -
+    windows are used directly and NO live-DB scan happens for that day -
     clean days cost nothing, known outages are queued straight to fetch.
 
     Fallback - for any day with no log data at all (log wasn't running,
     or predates this feature), fall back to the second-level timestamp
-    scan of this symbol's own SQLite data, same as before.
+    scan of this symbol's own live-DB data (PostgreSQL), same as before.
 
     `log_windows_cache` lets the caller compute each day's log windows once
     and reuse them across all symbols, since log-derived windows are
@@ -439,8 +352,10 @@ def _find_symbol_gaps(
                     )
             elif not log_windows and first_time_for_day:
                 # Log says "clean" - verify that's actually true before
-                # trusting it. See _day_has_any_data docstring for why.
-                if not _day_has_any_data(db_paths, day, session_start, session_end):
+                # trusting it. See live_any_row_in_range's docstring for why.
+                day_start_ms = int(session_start.timestamp() * 1000)
+                day_end_ms   = int(session_end.timestamp() * 1000)
+                if live_conn is None or not live_any_row_in_range(live_conn, day_start_ms, day_end_ms):
                     print(
                         f"[GAP_DETECTOR][WARN] {day} connection log reports a clean "
                         "day, but zero rows exist for ANY symbol in that window "
@@ -456,7 +371,16 @@ def _find_symbol_gaps(
             continue
 
         # -- no log data for this day - fall back to the data scan --------
-        timestamps = _get_timestamps_for_day(db_paths, table, day)
+        day_start_ms = int(
+            datetime.combine(day, MARKET_OPEN, tzinfo=tz_kolkata).timestamp() * 1000
+        )
+        day_end_ms = int(
+            datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata).timestamp() * 1000
+        )
+        timestamps = (
+            live_timestamps_for_range(live_conn, table, day_start_ms, day_end_ms)
+            if live_conn is not None else []
+        )
 
         if not timestamps:
             print(

@@ -2,11 +2,9 @@ import asyncio
 import json
 import os
 import shutil
-import sqlite3
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import request
 from urllib.error import URLError
@@ -14,7 +12,6 @@ from urllib.error import URLError
 from x9_data_fetcher.event_bus import is_ws_connected
 from x9_data_fetcher.gap_detector import (
     HistoryWindow,
-    _candidate_db_paths,
     _filter_gaps_already_in_history,
     _find_symbol_gaps,
     _history_connection,
@@ -31,7 +28,12 @@ from x9_data_fetcher.market_time import (
     tz_kolkata,
 )
 from x9_data_fetcher import pg_writer as _pg_writer_module
-from x9_data_fetcher.pg_writer import PgWriter
+from x9_data_fetcher.pg_writer import (
+    LIVE_TICK_RETENTION_TRADING_DAYS,
+    PgWriter,
+    live_connection,
+    live_latest_quote_timestamp,
+)
 
 
 # Second-level gap detection constants are owned by gap_detector.py now;
@@ -115,74 +117,34 @@ def _progress_done() -> None:
 # DB helpers kept for start_data.py compatibility
 # ---------------------------------------------------------------------------
 
-def _quote_tables(conn: sqlite3.Connection) -> List[str]:
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'quote_%'"
-    )
-    return [row[0] for row in cur.fetchall()]
-
-
-def _latest_from_raw_rows(conn: sqlite3.Connection, table: str) -> Optional[int]:
-    latest: Optional[int] = None
-    cur = conn.execute(
-        f"SELECT timestamp, raw_json FROM {table} ORDER BY rowid DESC LIMIT 1000"
-    )
-    for ts_value, raw_json in cur.fetchall():
-        ts_ms = _to_ms(ts_value)
-        if ts_ms is None and raw_json:
-            try:
-                payload = json.loads(raw_json)
-                ts_ms = _to_ms(payload.get("timestamp") or payload.get("ltt"))
-            except Exception:
-                ts_ms = None
-        if ts_ms is not None and (latest is None or ts_ms > latest):
-            latest = ts_ms
-    return latest
-
-
-def _latest_timestamp_in_db(db_path: Path) -> Optional[int]:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        latest: Optional[int] = None
-        for table in _quote_tables(conn):
-            try:
-                cur = conn.execute(f"SELECT MAX(timestamp) FROM {table}")
-                ts_ms = _to_ms(cur.fetchone()[0])
-                if ts_ms is None:
-                    ts_ms = _latest_from_raw_rows(conn, table)
-                if ts_ms is not None and (latest is None or ts_ms > latest):
-                    latest = ts_ms
-            except Exception as exc:
-                print(
-                    f"[BACKFILL][WARN] failed scanning {db_path.name}:{table}: {exc}",
-                    flush=True,
-                )
-        return latest
-    finally:
-        conn.close()
-
+# NOTE: this used to scan weekly SQLite DBs (_quote_tables, _latest_from_raw_rows,
+# _latest_timestamp_in_db) — removed now that hourly rollover deletes each local
+# file shortly after archiving it. Old version is in git history if ever needed.
 
 def latest_collected_timestamp(quote_output_dir: str) -> Optional[datetime]:
     """
-    Scan all weekly SQLite DBs and return the most recent quote timestamp.
-    Called from start_data.py BEFORE the websocket starts.
+    Return the most recent quote timestamp across all symbols, read from the
+    live PostgreSQL DB. Called from start_data.py BEFORE the websocket starts.
+
+    quote_output_dir is accepted for call-site compatibility with
+    start_data.py but is no longer used — the live DB replaces the local
+    SQLite scan as the source of truth.
     """
-    base_dir = Path(quote_output_dir)
-    for db_path in _candidate_db_paths(base_dir):
-        try:
-            ts_ms = _latest_timestamp_in_db(db_path)
-        except sqlite3.Error as exc:
-            print(f"[BACKFILL][WARN] failed opening {db_path.name}: {exc}", flush=True)
-            continue
-        if ts_ms is not None:
-            latest = _ms_to_ist(ts_ms)
-            print(
-                f"[BACKFILL] pre-startup latest quote: {latest.isoformat()} "
-                f"from {db_path.name}",
-                flush=True,
-            )
-            return latest
-    return None
+    try:
+        conn = live_connection()
+    except Exception as exc:
+        print(f"[BACKFILL][WARN] could not reach live DB for resume point: {exc}", flush=True)
+        return None
+    try:
+        ts_ms = live_latest_quote_timestamp(conn)
+    finally:
+        conn.close()
+
+    if ts_ms is None:
+        return None
+    latest = _ms_to_ist(ts_ms)
+    print(f"[BACKFILL] pre-startup latest quote: {latest.isoformat()}", flush=True)
+    return latest
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +258,18 @@ class BackfillManager:
         self.min_days           = max(
             3, int(os.getenv("X9_BACKFILL_MIN_DAYS", "3").strip() or "3")
         )
+        if self.min_days > LIVE_TICK_RETENTION_TRADING_DAYS:
+            print(
+                f"[BACKFILL][WARN] X9_BACKFILL_MIN_DAYS={self.min_days} exceeds "
+                f"the live DB's actual retention window "
+                f"({LIVE_TICK_RETENTION_TRADING_DAYS} trading days) — gap "
+                f"detection can only see what PG still has. Days beyond "
+                f"{LIVE_TICK_RETENTION_TRADING_DAYS} back will silently look "
+                f"'missing' even if they were once collected and simply purged. "
+                f"Lower X9_BACKFILL_MIN_DAYS to match, or raise PG's "
+                f"keep_trading_days if you actually need a longer lookback.",
+                flush=True,
+            )
         self.flush_batch_size   = flush_batch_size
         self.flush_interval_sec = flush_interval_sec
         self._writer: Optional[PgWriter] = None
@@ -346,19 +320,19 @@ class BackfillManager:
     def _run_once(self) -> None:
         now           = now_kolkata()
         required_days = _last_n_trading_days(now, self.min_days)
-        db_paths      = _candidate_db_paths(Path(self.quote_output_dir))
 
         print(
             f"[BACKFILL] scanning last {self.min_days} trading days "
             f"({required_days[0] if required_days else '?'} → "
             f"{required_days[-1] if required_days else '?'}) "
-            f"across {len(db_paths)} DB file(s)",
+            f"against the live PostgreSQL DB",
             flush=True,
         )
 
         # ── per-symbol gap detection ──────────────────────────────────────
         all_gaps: Dict[str, Tuple[str, List[HistoryWindow]]] = {}
         history_conn = None
+        live_conn = None
         # computed once per day, shared across all symbols — log-derived
         # windows are system-wide (same outage applies to every symbol)
         log_windows_cache: Dict[date, Optional[List[HistoryWindow]]] = {}
@@ -368,6 +342,16 @@ class BackfillManager:
         except Exception as exc:
             print(
                 f"[BACKFILL][WARN] history DB check unavailable: {exc}",
+                flush=True,
+            )
+
+        try:
+            live_conn = live_connection()
+        except Exception as exc:
+            print(
+                f"[BACKFILL][WARN] live DB unavailable for gap scan — falling back "
+                f"to log-only detection, days with no log data will be treated as "
+                f"full gaps: {exc}",
                 flush=True,
             )
 
@@ -382,7 +366,7 @@ class BackfillManager:
                 exchange = str(symbol_row.get("exchange") or "NSE").upper()
 
                 gaps = _find_symbol_gaps(
-                    db_paths,
+                    live_conn,
                     symbol,
                     required_days,
                     self._last_known_timestamp,
@@ -426,6 +410,11 @@ class BackfillManager:
             if history_conn is not None:
                 try:
                     history_conn.close()
+                except Exception:
+                    pass
+            if live_conn is not None:
+                try:
+                    live_conn.close()
                 except Exception:
                     pass
 
