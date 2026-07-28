@@ -575,12 +575,32 @@ def _reconcile_columns(
     'timestamp' (the only NOT NULL column here) should already be present
     on any real table anyway; this is just a defensive guard against that
     one failure mode, not an expected case.
+
+    Also handles a second, distinct legacy shape: a table created before
+    the JSONB->typed-columns migration ever touched it at all, which still
+    has the old raw_json JSONB NOT NULL column sitting alongside the newly
+    added typed columns. The typed-column insert path never writes
+    raw_json, so its NOT NULL constraint would block every insert forever
+    the same way the missing typed columns did — confirmed live (two
+    symbols hit this exact case after the missing-columns fix went out).
+    Only the NOT NULL constraint is dropped, never the column itself or
+    its data — any already-populated raw_json values for old rows are
+    left completely alone.
     """
     defs = _QUOTE_COLUMN_DEFS if prefix == "quote" else _DEPTH_COLUMN_DEFS
     cur = conn.cursor()
     for name, sql_type in defs:
         alter_type = sql_type.replace(" NOT NULL", "")
         cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {alter_type}")
+
+    cur.execute(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_name = %s AND column_name = 'raw_json'",
+        (table,),
+    )
+    row = cur.fetchone()
+    if row is not None and row[0] == "NO":
+        cur.execute(f"ALTER TABLE {table} ALTER COLUMN raw_json DROP NOT NULL")
 
 
 @lru_cache(maxsize=512)
