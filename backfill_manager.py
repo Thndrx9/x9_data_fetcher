@@ -740,6 +740,29 @@ class DailyCloseManager:
             print(f"[DAILY_CLOSE][BACKFILL][ERROR] {exc}", flush=True)
 
     def backfill_missing_days(self, required_days: List[date]) -> None:
+        # This class's whole contract is "these are past, finalized trading
+        # days" (see run_backfill's docstring) — the broker has no daily
+        # candle for today until after 15:30 IST close, so fetching it
+        # earlier just fails every time and retries forever. Rather than
+        # trust every caller to always filter today out correctly
+        # (start_data.py's startup call passes _last_n_trading_days(now, n),
+        # which — correctly, for the tick-level BackfillManager it's also
+        # used for — includes today the moment it's a trading day, closed
+        # or not), enforce the invariant here, once, for every caller.
+        now = now_kolkata()
+        today_closed = now.time() >= MARKET_CLOSE
+        if not today_closed:
+            before = len(required_days)
+            required_days = [d for d in required_days if d != now.date()]
+            if len(required_days) != before:
+                print(
+                    f"[DAILY_CLOSE][BACKFILL] excluding {now.date()} — "
+                    f"market hasn't closed yet today, no daily candle exists to fetch",
+                    flush=True,
+                )
+        if not required_days:
+            return
+
         try:
             conn = _history_connection(self.history_dbname)
         except Exception as exc:
