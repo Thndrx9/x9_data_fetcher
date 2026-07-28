@@ -35,9 +35,11 @@ IST = ZoneInfo("Asia/Kolkata")
 #   → _load_existing_tables() reads sqlite_master and pre-populates
 #     known_tables so CREATE TABLE is skipped for existing ones
 #
-# Weekly rollover (Monday midnight IST):
+# Hourly rollover (top of every IST hour):
 #   → old DB closed, new DB opened
 #   → known_tables reset to empty — tables re-created as ticks arrive
+#   → the just-closed file is picked up and archived to Parquet by the
+#     separate parquet_archiver.py process (never by this writer itself)
 # ---------------------------------------------------------------------------
 
 
@@ -46,14 +48,18 @@ def _safe_symbol(symbol: str) -> str:
     return "".join(c for c in symbol if c.isalnum() or c == "_")
 
 
-def _weekly_db_path(base_dir: Path) -> Path:
-    """Returns e.g. <base_dir>/market_2026_W24.db — rolls over every Monday."""
-    week = datetime.now(IST).strftime("%Y_W%W")
-    return base_dir / f"market_{week}.db"
+def _hourly_db_path(base_dir: Path) -> Path:
+    """Returns e.g. <base_dir>/market_2026-06-12_14.db — rolls over every hour.
+
+    Hour is zero-padded (00-23) so filenames sort correctly and
+    parquet_archiver.py can parse the hour back out unambiguously.
+    """
+    stamp = datetime.now(IST).strftime("%Y-%m-%d_%H")
+    return base_dir / f"market_{stamp}.db"
 
 
 def _open_db(db_path: Path) -> sqlite3.Connection:
-    """Open (or create) the weekly SQLite file and set performance pragmas."""
+    """Open (or create) the hourly SQLite file and set performance pragmas."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not db_path.exists()
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -136,7 +142,7 @@ class OhlcParquetWriter:
     """
     Buffered single-writer for quote tick rows used for later candle generation.
 
-    Storage layout inside <base_dir>/market_YYYY_WXX.db:
+    Storage layout inside <base_dir>/market_YYYY-MM-DD_HH.db (rolls over hourly):
         quote_RELIANCE   ← one table per symbol
         quote_TCS
         quote_WIPRO      ← created automatically on first tick
@@ -193,7 +199,7 @@ class OhlcParquetWriter:
         buffered: Dict[str, List[dict]] = {}
         last_flush = time.monotonic()
 
-        current_db_path = _weekly_db_path(self.base_dir)
+        current_db_path = _hourly_db_path(self.base_dir)
         conn = _open_db(current_db_path)
         known_tables = _load_existing_tables(conn)  # pre-load on restart
 
@@ -201,6 +207,30 @@ class OhlcParquetWriter:
             should_exit = self._stop.is_set() and self._q.empty()
             if should_exit:
                 break
+
+            # Check for hourly rollover BEFORE pulling the next row off the
+            # queue. This must happen first: if a row is popped and appended
+            # to `buffered` ahead of this check, a tick that arrives right at
+            # the hour boundary gets appended under the OLD hour's buffer,
+            # and then flushed straight into the OLD hour's (about to close)
+            # connection instead of the new one — misfiling it by up to one
+            # row. Checking first means any row popped this iteration is
+            # appended only after the writer has already switched to
+            # whichever connection is actually current. (A ~0.25s residual
+            # window remains — the width of the queue poll timeout below —
+            # which is an inherent limit of a polling loop, not fixable
+            # without switching the whole writer to an event-driven model.)
+            new_db_path = _hourly_db_path(self.base_dir)
+            if new_db_path != current_db_path:
+                self._flush(conn, buffered, known_tables)
+                conn.close()
+                current_db_path = new_db_path
+                conn = _open_db(current_db_path)
+                known_tables = set()   # new DB — no tables yet
+                print(
+                    f"[OHLC_WRITER] hourly rollover → {current_db_path.name}",
+                    flush=True,
+                )
 
             try:
                 symbol, row = self._q.get(timeout=0.25)
@@ -216,19 +246,6 @@ class OhlcParquetWriter:
             )
 
             if due_time or due_batch:
-                # weekly rollover — close old DB, open new one
-                new_db_path = _weekly_db_path(self.base_dir)
-                if new_db_path != current_db_path:
-                    self._flush(conn, buffered, known_tables)
-                    conn.close()
-                    current_db_path = new_db_path
-                    conn = _open_db(current_db_path)
-                    known_tables = set()   # new DB — no tables yet
-                    print(
-                        f"[OHLC_WRITER] weekly rollover → {current_db_path.name}",
-                        flush=True,
-                    )
-
                 self._flush(conn, buffered, known_tables)
                 last_flush = now
 
