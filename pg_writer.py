@@ -449,44 +449,11 @@ def _ensure_table(
     cur = conn.cursor()
 
     if prefix == "quote":
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                timestamp       BIGINT NOT NULL,
-                ingest_ns       BIGINT,
-                ltp             DOUBLE PRECISION,
-                ltt             BIGINT,
-                volume          BIGINT,
-                open            DOUBLE PRECISION,
-                high            DOUBLE PRECISION,
-                low             DOUBLE PRECISION,
-                close           DOUBLE PRECISION,
-                last_quantity   BIGINT,
-                oi              BIGINT,
-                upper_circuit   DOUBLE PRECISION,
-                lower_circuit   DOUBLE PRECISION
-            )
-        """)
+        col_defs = ",\n                ".join(f"{name} {typ}" for name, typ in _QUOTE_COLUMN_DEFS)
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {table} (\n                {col_defs}\n            )")
     elif prefix == "depth":
-        level_cols = ",\n                ".join(
-            f"{side}{lvl}_price DOUBLE PRECISION, "
-            f"{side}{lvl}_qty BIGINT, "
-            f"{side}{lvl}_orders BIGINT"
-            for side in ("buy", "sell")
-            for lvl in range(5)
-        )
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                timestamp       BIGINT NOT NULL,
-                ingest_ns       BIGINT,
-                ltp             DOUBLE PRECISION,
-                volume          BIGINT,
-                last_quantity   BIGINT,
-                oi              BIGINT,
-                upper_circuit   DOUBLE PRECISION,
-                lower_circuit   DOUBLE PRECISION,
-                {level_cols}
-            )
-        """)
+        col_defs = ",\n                ".join(f"{name} {typ}" for name, typ in _DEPTH_COLUMN_DEFS)
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {table} (\n                {col_defs}\n            )")
     else:
         # 'daily' and anything else: unchanged legacy JSONB schema
         cur.execute(f"""
@@ -522,25 +489,98 @@ def _load_existing_tables(
         (f"{prefix}_%",),
     )
     tables = {row[0] for row in cur.fetchall()}
+
+    # Self-heal any table whose schema predates the current column set
+    # (e.g. created under an older code version) — see _reconcile_columns
+    # for why this can't just happen lazily inside _ensure_table. Only
+    # applies to the typed-column tables; 'daily' and anything else stays
+    # on the legacy JSONB schema untouched.
+    if tables and prefix in ("quote", "depth"):
+        try:
+            for table in tables:
+                _reconcile_columns(conn, table, prefix)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            _safe_print(
+                f"[PG_{prefix.upper()}][ERROR] schema reconciliation failed: {exc} "
+                f"— tables may still be missing columns from an older schema"
+            )
+
     if tables:
         _safe_print(f"[PG_{prefix.upper()}] found {len(tables)} existing tables")
     return tables
 
 
-_QUOTE_COLUMNS = (
-    "timestamp", "ingest_ns", "ltp", "ltt", "volume", "open", "high", "low",
-    "close", "last_quantity", "oi", "upper_circuit", "lower_circuit",
+# Single source of truth for quote/depth schema: (column_name, sql_type).
+# CREATE TABLE, the column-repair ALTER statements below, AND the INSERT
+# column list (_QUOTE_COLUMNS/_DEPTH_COLUMNS, derived) all come from these
+# two tuples now, instead of three separately-hand-maintained copies that
+# could silently drift out of sync with each other.
+#
+# Order matters and must exactly match _parse()'s positional tuple output
+# for "quote"/"depth" above — execute_values() supplies values purely by
+# position, with no column-name matching at all.
+_QUOTE_COLUMN_DEFS = (
+    ("timestamp", "BIGINT NOT NULL"),
+    ("ingest_ns", "BIGINT"),
+    ("ltp", "DOUBLE PRECISION"),
+    ("ltt", "BIGINT"),
+    ("volume", "BIGINT"),
+    ("open", "DOUBLE PRECISION"),
+    ("high", "DOUBLE PRECISION"),
+    ("low", "DOUBLE PRECISION"),
+    ("close", "DOUBLE PRECISION"),
+    ("last_quantity", "BIGINT"),
+    ("oi", "BIGINT"),
+    ("upper_circuit", "DOUBLE PRECISION"),
+    ("lower_circuit", "DOUBLE PRECISION"),
 )
 
-_DEPTH_COLUMNS = (
-    "timestamp", "ingest_ns", "ltp", "volume", "last_quantity", "oi",
-    "upper_circuit", "lower_circuit",
+_DEPTH_COLUMN_DEFS = (
+    ("timestamp", "BIGINT NOT NULL"),
+    ("ingest_ns", "BIGINT"),
+    ("ltp", "DOUBLE PRECISION"),
+    ("volume", "BIGINT"),
+    ("last_quantity", "BIGINT"),
+    ("oi", "BIGINT"),
+    ("upper_circuit", "DOUBLE PRECISION"),
+    ("lower_circuit", "DOUBLE PRECISION"),
 ) + tuple(
-    f"{side}{lvl}_{field}"
+    (f"{side}{lvl}_{field}", "DOUBLE PRECISION" if field == "price" else "BIGINT")
     for side in ("buy", "sell")
     for lvl in range(5)
     for field in ("price", "qty", "orders")
 )
+
+_QUOTE_COLUMNS = tuple(name for name, _ in _QUOTE_COLUMN_DEFS)
+_DEPTH_COLUMNS = tuple(name for name, _ in _DEPTH_COLUMN_DEFS)
+
+
+def _reconcile_columns(
+    conn: psycopg2.extensions.connection, table: str, prefix: str
+) -> None:
+    """
+    Self-heal a table's schema against a stale/partial CREATE. Needed
+    because 'CREATE TABLE IF NOT EXISTS' is a no-op on a table that
+    already exists — a table created under an older code version (fewer
+    columns, or the pre-migration JSONB-only schema) would otherwise keep
+    silently failing every insert forever ("column X does not exist"),
+    since nothing ever goes back and patches it.
+
+    ADD COLUMN IF NOT EXISTS is idempotent and cheap when nothing needs
+    adding, so this is safe to call unconditionally. NOT NULL is
+    deliberately stripped for the ALTER form — adding a NOT NULL column
+    with no DEFAULT fails outright on a table that already has rows, and
+    'timestamp' (the only NOT NULL column here) should already be present
+    on any real table anyway; this is just a defensive guard against that
+    one failure mode, not an expected case.
+    """
+    defs = _QUOTE_COLUMN_DEFS if prefix == "quote" else _DEPTH_COLUMN_DEFS
+    cur = conn.cursor()
+    for name, sql_type in defs:
+        alter_type = sql_type.replace(" NOT NULL", "")
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {alter_type}")
 
 
 @lru_cache(maxsize=512)
