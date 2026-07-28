@@ -1,7 +1,9 @@
 import asyncio
+import atexit
 import fcntl
 import os
 import signal
+import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -12,7 +14,7 @@ from dotenv import load_dotenv
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from x9_data_fetcher.venv_setup import create_and_activate_venv
+from x9_data_fetcher.venv_setup import VENV_DIR, create_and_activate_venv
 
 create_and_activate_venv()
 
@@ -35,7 +37,39 @@ from x9_data_fetcher.market_time import (
 )
 from x9_data_fetcher.symbols import load_symbols
 from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup, purge_old_data
+from x9_data_fetcher import parquet_archiver
 from x9_data_fetcher.websocket_connect import websocket_client
+
+
+# Directory containing the x9_data_fetcher package — same one this file
+# inserts into sys.path above when run directly. The archiver subprocess
+# needs this as its cwd so `python -m x9_data_fetcher.parquet_archiver`
+# resolves regardless of whatever cwd start_data.py itself happened to be
+# launched from.
+_PACKAGE_PARENT_DIR = Path(__file__).resolve().parent.parent
+
+# Resolved eagerly, at import time — VENV_DIR is a relative path resolved
+# against whatever the process's cwd was when create_and_activate_venv()
+# ran above, which may differ from _PACKAGE_PARENT_DIR. Resolving the venv
+# directory itself now (before anything changes directories) pins it to
+# the right venv regardless of what cwd the archiver subprocess is later
+# launched with.
+#
+# IMPORTANT: only the venv directory portion is resolved — the trailing
+# bin/python is left as-is. venv's bin/python is a symlink to the base
+# system interpreter, and Python's venv detection at startup depends on
+# invoking it AS that symlink (it looks for a pyvenv.cfg next to
+# sys.executable's own path). Fully resolving through the symlink would
+# hand subprocess.Popen the bare system interpreter's real path instead —
+# which looks identical for stdlib-only scripts, but silently loses access
+# to every package actually installed in this venv (confirmed: psycopg2
+# imports fine via the symlink path, ModuleNotFoundError via the resolved
+# system path).
+_ARCHIVER_PYTHON = (
+    Path(VENV_DIR).resolve()
+    / ("Scripts" if os.name == "nt" else "bin")
+    / ("python.exe" if os.name == "nt" else "python")
+)
 
 
 _LOCK_FILE_PATH = os.getenv("X9_FETCHER_LOCK_FILE", "/tmp/x9_data_fetcher.lock")
@@ -79,6 +113,51 @@ def _drain_queue():
             break
     if dropped:
         print(f"[X9_FETCHER] Drained {dropped} stale packets from queue", flush=True)
+
+
+def _start_archiver_process() -> "subprocess.Popen | None":
+    """
+    Launch parquet_archiver.py as its own OS process (never a thread in
+    this process — see parquet_archiver.py's module docstring for why).
+    Runs for the lifetime of this script, across sessions/days; only the
+    end-of-day force_all sweep + daily/weekly merge (triggered separately,
+    right after fetcher.shutdown()) needs synchronous handling — the
+    hourly sweep this subprocess performs on its own schedule doesn't.
+    """
+    enabled = os.getenv("X9_ARCHIVER_ENABLED", "1").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        print("[X9_FETCHER] Parquet archiver disabled (X9_ARCHIVER_ENABLED)", flush=True)
+        return None
+    if not _ARCHIVER_PYTHON.exists():
+        print(
+            f"[X9_FETCHER][WARN] archiver interpreter not found at "
+            f"{_ARCHIVER_PYTHON} — skipping archiver process",
+            flush=True,
+        )
+        return None
+    try:
+        proc = subprocess.Popen(
+            [str(_ARCHIVER_PYTHON), "-m", "x9_data_fetcher.parquet_archiver"],
+            cwd=str(_PACKAGE_PARENT_DIR),
+        )
+        print(f"[X9_FETCHER] Parquet archiver process started (pid={proc.pid})", flush=True)
+        return proc
+    except Exception as exc:
+        print(f"[X9_FETCHER][WARN] failed to start archiver process: {exc}", flush=True)
+        return None
+
+
+def _stop_archiver_process(proc: "subprocess.Popen | None") -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print("[X9_FETCHER][WARN] archiver process did not exit in time — killing", flush=True)
+        proc.kill()
+        proc.wait(timeout=5)
+    print("[X9_FETCHER] Parquet archiver process stopped", flush=True)
 
 
 async def run_engine():
@@ -127,6 +206,20 @@ async def run_engine():
     # skips instantly if already running, installs+configures if missing
     if os.getenv("PG_HOST", "").strip() or os.getenv("X9_PG_DSN", "").strip():
         pg_auto_setup()
+
+    # ── Parquet archiver — separate OS process (not a thread here), so it
+    #    never contends with this process's event loop / GIL. Runs for the
+    #    whole lifetime of this script, across sessions/days; it sweeps
+    #    closed hourly SQLite files on its own schedule. The end-of-day
+    #    force_all sweep + daily/weekly merge are triggered separately,
+    #    synchronously, right after fetcher.shutdown() below — see there. ──
+    archiver_proc = _start_archiver_process()
+    # atexit is the safety net for any exit path that isn't the explicit
+    # manual-shutdown stop below (e.g. an unhandled exception propagating
+    # out of the daily loop) — terminate()/wait() on an already-stopped
+    # process is a safe no-op, so it's fine if both this and the explicit
+    # stop below end up running.
+    atexit.register(_stop_archiver_process, archiver_proc)
 
     instruments = [{"exchange": s["exchange"], "symbol": s["symbol"]} for s in symbols]
 
@@ -330,6 +423,25 @@ async def run_engine():
 
         fetcher.shutdown()
 
+        # ── End-of-day archive sweep + daily/weekly merge — must run AFTER
+        #    fetcher.shutdown() (not the DailyCloseManager call above),
+        #    because that's the point the day's final hourly SQLite file is
+        #    actually closed. force_all=True is safe here specifically
+        #    because we've just confirmed the writer has stopped — this is
+        #    the ONE place outside the standalone archiver loop that's
+        #    allowed to pass it. Natural close only, same guard as the
+        #    daily-close price above: a manual stop mid-session hasn't
+        #    actually finished the trading day, so nothing should be merged.
+        if session_stop.is_set() and not manual_stop.is_set():
+            try:
+                today = now_kolkata().date()
+                await asyncio.to_thread(parquet_archiver.run_once, True)
+                await asyncio.to_thread(parquet_archiver.merge_daily, today)
+                if parquet_archiver.is_last_trading_day_of_week(today):
+                    await asyncio.to_thread(parquet_archiver.merge_weekly, today)
+            except Exception as exc:
+                print(f"[ARCHIVER][ERROR] end-of-day archive/merge failed: {exc}", flush=True)
+
         if manual_stop.is_set():
             # Cancel startup backfill tasks if still running
             if startup_backfill_task and not startup_backfill_task.done():
@@ -338,6 +450,7 @@ async def run_engine():
             if daily_backfill_task and not daily_backfill_task.done():
                 daily_backfill_task.cancel()
                 await asyncio.gather(daily_backfill_task, return_exceptions=True)
+            _stop_archiver_process(archiver_proc)
             print("[X9_FETCHER] Manual shutdown complete", flush=True)
             break
 
@@ -367,4 +480,4 @@ if __name__ == "__main__":
             flush=True,
         )
         sys.exit(1)
-    asyncio.run(run_engine())
+    asyncio.run(run_engine())s

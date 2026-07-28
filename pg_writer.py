@@ -1082,6 +1082,27 @@ class PgWriter:
         # otherwise be silently lost when this thread exits
         _spillover_write(self.table, buffered, self._tag)
 
+    def _reconnect_after_failure(
+        self,
+        conn: Optional[psycopg2.extensions.connection],
+        buffered: Dict[str, List[dict]],
+        pending_commit: Dict[str, List[dict]],
+    ):
+        """Close a connection that's beyond recovery (e.g. a savepoint
+        rollback itself failed, or the final commit failed) and reconnect.
+        Anything in `pending_commit` was execute_values'd but never
+        committed, so it goes back into `buffered` for the next flush.
+        """
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = self._connect()
+        known_tables = _load_existing_tables(conn, self.table) if conn else set()
+        for sym, rows in pending_commit.items():
+            buffered[sym] = _cap_retry_rows(sym, rows + buffered.get(sym, []), self._tag)
+        return conn, known_tables
+
     def _flush(
         self,
         conn: Optional[psycopg2.extensions.connection],
@@ -1098,16 +1119,42 @@ class PgWriter:
             if not rows:
                 continue
 
+            # Each symbol gets its own savepoint around ensure_table and
+            # around the insert. Without this, a failure on one symbol
+            # aborts the *entire* shared transaction in Postgres — every
+            # symbol processed afterward in this flush cycle fails too
+            # (cascading "current transaction is aborted" errors) — and the
+            # final conn.commit() below does not raise when the transaction
+            # is already aborted (Postgres treats COMMIT-while-aborted as a
+            # ROLLBACK), so symbols that succeeded earlier in this same
+            # flush get silently discarded with no error ever logged for
+            # them. Rolling back to a per-symbol savepoint clears the
+            # aborted state without touching anyone else's work.
+            #
+            # NOTE: _ensure_table() calls conn.commit() itself when it
+            # creates a brand-new table, which ends the transaction and
+            # destroys any savepoint taken before it runs. So the
+            # ensure_table step and the insert step each need their own
+            # fresh savepoint — they can't share one.
             try:
+                conn.cursor().execute("SAVEPOINT sp_ensure_table")
                 table = _ensure_table(conn, self.table, sym, known_tables, self._dedup)
             except Exception as exc:
                 _safe_print(
                     f"{self._tag}[ERROR] ensure table failed for {sym}: {exc} "
                     f"— {len(rows)} row(s) kept for retry next flush"
                 )
-                # retried next round, but still capped in case this keeps
-                # failing indefinitely (e.g. a permissions problem)
                 buffered[sym] = _cap_retry_rows(sym, rows, self._tag)
+                try:
+                    conn.cursor().execute("ROLLBACK TO SAVEPOINT sp_ensure_table")
+                except Exception as rb_exc:
+                    # connection itself is unusable — abandon this flush
+                    # cycle and reconnect, same as a commit failure below
+                    _safe_print(
+                        f"{self._tag}[ERROR] savepoint rollback failed: {rb_exc} "
+                        f"— reconnecting"
+                    )
+                    return self._reconnect_after_failure(conn, buffered, pending_commit)
                 continue
 
             sql = _insert_sql(table, self.table, self._dedup)
@@ -1135,6 +1182,7 @@ class PgWriter:
             if good_parsed:
                 try:
                     cur = conn.cursor()
+                    cur.execute("SAVEPOINT sp_insert")
                     psycopg2.extras.execute_values(cur, sql, good_parsed)
                     any_rows = True
                     pending_commit[sym] = good_raw
@@ -1145,6 +1193,14 @@ class PgWriter:
                         f"— {len(good_raw)} row(s) kept for retry next flush"
                     )
                     buffered[sym] = _cap_retry_rows(sym, good_raw, self._tag)
+                    try:
+                        conn.cursor().execute("ROLLBACK TO SAVEPOINT sp_insert")
+                    except Exception as rb_exc:
+                        _safe_print(
+                            f"{self._tag}[ERROR] savepoint rollback failed: {rb_exc} "
+                            f"— reconnecting"
+                        )
+                        return self._reconnect_after_failure(conn, buffered, pending_commit)
             else:
                 buffered[sym] = []
 
@@ -1157,16 +1213,6 @@ class PgWriter:
                     f"{self._tag}[ERROR] commit failed: {exc} — reconnecting, "
                     f"{total_retry} row(s) kept for retry next flush"
                 )
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = self._connect()
-                known_tables = _load_existing_tables(conn, self.table) if conn else set()
-                # transaction rolled back (or connection is gone) — put the
-                # rows that were execute_values'd but never committed back
-                # into buffered so the next flush retries them
-                for sym, rows in pending_commit.items():
-                    buffered[sym] = _cap_retry_rows(sym, rows + buffered.get(sym, []), self._tag)
+                return self._reconnect_after_failure(conn, buffered, pending_commit)
 
         return conn, known_tables
