@@ -115,7 +115,7 @@ def _drain_queue():
         print(f"[X9_FETCHER] Drained {dropped} stale packets from queue", flush=True)
 
 
-def _start_archiver_process() -> "subprocess.Popen | None":
+def _start_archiver_process(depth_output_dir: str, quote_output_dir: str) -> "subprocess.Popen | None":
     """
     Launch parquet_archiver.py as its own OS process (never a thread in
     this process — see parquet_archiver.py's module docstring for why).
@@ -136,9 +136,22 @@ def _start_archiver_process() -> "subprocess.Popen | None":
         )
         return None
     try:
+        # Pin these as ABSOLUTE paths, resolved against *this* process's
+        # cwd (the one the live writer is actually using) — not the
+        # archiver subprocess's cwd (_PACKAGE_PARENT_DIR, needed only for
+        # `-m` module resolution). Without this, if start_data.py is
+        # launched from anywhere other than _PACKAGE_PARENT_DIR, the
+        # archiver silently looks in the wrong data/ dir all day and only
+        # the end-of-day in-process force_all sweep (which shares this
+        # process's cwd) ever finds anything.
+        env = os.environ.copy()
+        env["X9_DEPTH_OUTPUT_DIR"] = str(Path(depth_output_dir).resolve())
+        env["X9_QUOTE_OUTPUT_DIR"] = str(Path(quote_output_dir).resolve())
+        env["X9_ARCHIVE_DIR"] = str(Path(os.getenv("X9_ARCHIVE_DIR", "archive")).resolve())
         proc = subprocess.Popen(
             [str(_ARCHIVER_PYTHON), "-m", "x9_data_fetcher.parquet_archiver"],
             cwd=str(_PACKAGE_PARENT_DIR),
+            env=env,
         )
         print(f"[X9_FETCHER] Parquet archiver process started (pid={proc.pid})", flush=True)
         return proc
@@ -213,7 +226,7 @@ async def run_engine():
     #    closed hourly SQLite files on its own schedule. The end-of-day
     #    force_all sweep + daily/weekly merge are triggered separately,
     #    synchronously, right after fetcher.shutdown() below — see there. ──
-    archiver_proc = _start_archiver_process()
+    archiver_proc = _start_archiver_process(depth_output_dir, quote_output_dir)
     # atexit is the safety net for any exit path that isn't the explicit
     # manual-shutdown stop below (e.g. an unhandled exception propagating
     # out of the daily loop) — terminate()/wait() on an already-stopped
