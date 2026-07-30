@@ -17,10 +17,12 @@ Design constraints this follows (see project notes):
     retried on the next pass — nothing is ever partially cleaned up.
 
 Layout produced:
-    <archive_root>/depth/<SYMBOL>/<YYYY-MM-DD>/<HH>.parquet   (hourly chunks)
-    <archive_root>/depth/<SYMBOL>/<YYYY-MM-DD>.parquet        (after daily merge)
-    <archive_root>/depth/<SYMBOL>/<YYYY>-W<WW>.parquet        (after weekly merge)
-    <archive_root>/quote/<SYMBOL>/...                          (same shape)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>/<HH>depth.parquet   (hourly chunks)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>/<HH>quote.parquet
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>depth.parquet         (after daily merge)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>quote.parquet
+    <archive_root>/<SYMBOL>/<YYYY>-W<WW>depth.parquet         (after weekly merge)
+    <archive_root>/<SYMBOL>/<YYYY>-W<WW>quote.parquet
 """
 
 import os
@@ -125,7 +127,7 @@ def _row_count(conn: sqlite3.Connection, table: str) -> int:
 
 
 def _chunk_path(archive_root: Path, prefix: str, symbol: str, day: date, hour: int) -> Path:
-    return archive_root / prefix / symbol / day.isoformat() / f"{hour:02d}.parquet"
+    return archive_root / symbol / day.isoformat() / f"{hour:02d}{prefix}.parquet"
 
 
 def _write_parquet(df: pd.DataFrame, path: Path) -> None:
@@ -246,15 +248,19 @@ def run_once(force_all: bool = False) -> None:
     archive_root = _archive_root()
     current_key = _current_hour_key()
     seen: set = set()
+    scanned = 0
+    archived = 0
 
     for base_dir in _source_dirs():
         if not base_dir.exists():
+            print(f"{_TAG}[WARN] source dir does not exist: {base_dir.resolve()}", flush=True)
             continue
         for db_path in sorted(base_dir.glob("market_*.db")):
             resolved = db_path.resolve()
             if resolved in seen:
                 continue  # depth/quote dirs can point at the same file
             seen.add(resolved)
+            scanned += 1
 
             parsed = _parse_hourly_filename(db_path.name)
             if parsed is None:
@@ -262,7 +268,13 @@ def run_once(force_all: bool = False) -> None:
             if not force_all and parsed == current_key:
                 continue  # still being written — never touch it
 
-            _archive_db_file(db_path, archive_root)
+            if _archive_db_file(db_path, archive_root):
+                archived += 1
+
+    if scanned == 0:
+        print(f"{_TAG} pass complete — no candidate files found", flush=True)
+    else:
+        print(f"{_TAG} pass complete — scanned {scanned}, archived {archived}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +282,7 @@ def run_once(force_all: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def _daily_path(archive_root: Path, prefix: str, symbol: str, day: date) -> Path:
-    return archive_root / prefix / symbol / f"{day.isoformat()}.parquet"
+    return archive_root / symbol / f"{day.isoformat()}{prefix}.parquet"
 
 
 def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
@@ -283,28 +295,28 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
     """
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:DAILY]"
+    if not archive_root.exists():
+        return
 
-    for prefix in ("depth", "quote"):
-        prefix_dir = archive_root / prefix
-        if not prefix_dir.exists():
+    for symbol_dir in sorted(archive_root.iterdir()):
+        if not symbol_dir.is_dir():
             continue
-        for symbol_dir in sorted(prefix_dir.iterdir()):
-            if not symbol_dir.is_dir():
-                continue
-            chunk_dir = symbol_dir / day.isoformat()
-            if not chunk_dir.exists():
-                continue
-            chunks = sorted(chunk_dir.glob("*.parquet"))
+        symbol = symbol_dir.name
+        chunk_dir = symbol_dir / day.isoformat()
+        if not chunk_dir.exists():
+            continue
+
+        for prefix in ("depth", "quote"):
+            chunks = sorted(chunk_dir.glob(f"*{prefix}.parquet"))
             if not chunks:
                 continue
 
-            symbol = symbol_dir.name
             try:
                 frames = [pd.read_parquet(c) for c in chunks]
                 src_count = sum(len(f) for f in frames)
                 merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             except Exception as exc:
-                print(f"{tag}[ERROR] read failed for {prefix}/{symbol}/{day}: {exc}", flush=True)
+                print(f"{tag}[ERROR] read failed for {symbol}/{prefix}/{day}: {exc}", flush=True)
                 continue
 
             out_path = _daily_path(archive_root, prefix, symbol, day)
@@ -312,19 +324,28 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
                 _write_parquet(merged, out_path)
                 written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
             except Exception as exc:
-                print(f"{tag}[ERROR] write/verify failed for {prefix}/{symbol}/{day}: {exc}", flush=True)
+                print(f"{tag}[ERROR] write/verify failed for {symbol}/{prefix}/{day}: {exc}", flush=True)
                 continue
 
             if written_count != src_count:
                 print(
-                    f"{tag}[ERROR] row count mismatch for {prefix}/{symbol}/{day}: "
+                    f"{tag}[ERROR] row count mismatch for {symbol}/{prefix}/{day}: "
                     f"chunks={src_count} merged={written_count} — hourly chunks kept",
                     flush=True,
                 )
                 continue
 
-            shutil.rmtree(chunk_dir)
-            print(f"{tag} merged {prefix}/{symbol}/{day} ({written_count} rows) — chunks removed", flush=True)
+            for c in chunks:
+                c.unlink()
+            print(f"{tag} merged {symbol}/{prefix}/{day} ({written_count} rows) — hourly chunks removed", flush=True)
+
+        # Both depth and quote chunks share this one day directory now —
+        # only remove it once nothing (from either prefix) is left in it.
+        try:
+            if not any(chunk_dir.iterdir()):
+                chunk_dir.rmdir()
+        except OSError:
+            pass  # not empty (e.g. one prefix failed verification) — left for retry
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +354,7 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
 
 def _iso_week_path(archive_root: Path, prefix: str, symbol: str, any_day_in_week: date) -> Path:
     iso_year, iso_week, _ = any_day_in_week.isocalendar()
-    return archive_root / prefix / symbol / f"{iso_year}-W{iso_week:02d}.parquet"
+    return archive_root / symbol / f"{iso_year}-W{iso_week:02d}{prefix}.parquet"
 
 
 def _days_in_iso_week(any_day_in_week: date) -> List[date]:
@@ -361,19 +382,19 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
     tag = "[ARCHIVER:WEEKLY]"
     week_days = _days_in_iso_week(any_day_in_week)
 
-    for prefix in ("depth", "quote"):
-        prefix_dir = archive_root / prefix
-        if not prefix_dir.exists():
-            continue
-        for symbol_dir in sorted(prefix_dir.iterdir()):
-            if not symbol_dir.is_dir():
-                continue
+    if not archive_root.exists():
+        return
 
-            symbol = symbol_dir.name
+    for symbol_dir in sorted(archive_root.iterdir()):
+        if not symbol_dir.is_dir():
+            continue
+        symbol = symbol_dir.name
+
+        for prefix in ("depth", "quote"):
             daily_paths = [
-                symbol_dir / f"{d.isoformat()}.parquet"
+                symbol_dir / f"{d.isoformat()}{prefix}.parquet"
                 for d in week_days
-                if (symbol_dir / f"{d.isoformat()}.parquet").exists()
+                if (symbol_dir / f"{d.isoformat()}{prefix}.parquet").exists()
             ]
             if not daily_paths:
                 continue
@@ -383,7 +404,7 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
                 src_count = sum(len(f) for f in frames)
                 merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             except Exception as exc:
-                print(f"{tag}[ERROR] read failed for {prefix}/{symbol}: {exc}", flush=True)
+                print(f"{tag}[ERROR] read failed for {symbol}/{prefix}: {exc}", flush=True)
                 continue
 
             out_path = _iso_week_path(archive_root, prefix, symbol, any_day_in_week)
@@ -391,12 +412,12 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
                 _write_parquet(merged, out_path)
                 written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
             except Exception as exc:
-                print(f"{tag}[ERROR] write/verify failed for {prefix}/{symbol}: {exc}", flush=True)
+                print(f"{tag}[ERROR] write/verify failed for {symbol}/{prefix}: {exc}", flush=True)
                 continue
 
             if written_count != src_count:
                 print(
-                    f"{tag}[ERROR] row count mismatch for {prefix}/{symbol}: "
+                    f"{tag}[ERROR] row count mismatch for {symbol}/{prefix}: "
                     f"dailies={src_count} merged={written_count} — daily files kept",
                     flush=True,
                 )
