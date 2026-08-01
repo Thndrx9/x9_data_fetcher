@@ -1,7 +1,8 @@
 """
-Archives closed hourly SQLite files (produced by depth_parquet_writer.py /
-ohlc_parquet_writer.py) into zstd-compressed Parquet, one chunk per
-symbol per hour, then merges those into daily and weekly files.
+Archives closed hourly SQLite files (produced by tick_writer.py's two
+TickWriter instances — prefix="depth" and prefix="quote") into
+zstd-compressed Parquet, one chunk per symbol per hour, then merges those
+into daily and weekly files.
 
 Design constraints this follows (see project notes):
   - Runs as its OWN OS process, never a thread inside the live fetcher —
@@ -17,12 +18,12 @@ Design constraints this follows (see project notes):
     retried on the next pass — nothing is ever partially cleaned up.
 
 Layout produced:
-    <archive_root>/<SYMBOL>/<YYYY-MM-DD>/<HH>depth.parquet   (hourly chunks)
-    <archive_root>/<SYMBOL>/<YYYY-MM-DD>/<HH>quote.parquet
-    <archive_root>/<SYMBOL>/<YYYY-MM-DD>depth.parquet         (after daily merge)
-    <archive_root>/<SYMBOL>/<YYYY-MM-DD>quote.parquet
-    <archive_root>/<SYMBOL>/<YYYY>-W<WW>depth.parquet         (after weekly merge)
-    <archive_root>/<SYMBOL>/<YYYY>-W<WW>quote.parquet
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-<HH>depth.parquet   (hourly chunks)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-<HH>quote.parquet
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-depth.parquet        (after daily merge — deduped)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-quote.parquet
+    <archive_root>/<SYMBOL>/<YYYY>-W<WW>-depth.parquet        (after weekly merge)
+    <archive_root>/<SYMBOL>/<YYYY>-W<WW>-quote.parquet
 """
 
 import os
@@ -45,8 +46,8 @@ IST = ZoneInfo("Asia/Kolkata")
 
 _TAG = "[ARCHIVER]"
 
-# Matches the hourly filenames written by depth_parquet_writer.py /
-# ohlc_parquet_writer.py's _hourly_db_path(): market_2026-06-12_14.db
+# Matches the hourly filenames written by tick_writer.py's
+# _hourly_db_path(): market_2026-06-12_14.db
 _HOURLY_FILE_RE = re.compile(r"^market_(\d{4}-\d{2}-\d{2})_(\d{2})\.db$")
 
 # Matches per-symbol tables inside those files: depth_RELIANCE, quote_TCS
@@ -127,7 +128,7 @@ def _row_count(conn: sqlite3.Connection, table: str) -> int:
 
 
 def _chunk_path(archive_root: Path, prefix: str, symbol: str, day: date, hour: int) -> Path:
-    return archive_root / symbol / day.isoformat() / f"{hour:02d}{prefix}.parquet"
+    return archive_root / symbol / f"{day.isoformat()}-{hour:02d}{prefix}.parquet"
 
 
 def _write_parquet(df: pd.DataFrame, path: Path) -> None:
@@ -282,16 +283,23 @@ def run_once(force_all: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def _daily_path(archive_root: Path, prefix: str, symbol: str, day: date) -> Path:
-    return archive_root / symbol / f"{day.isoformat()}{prefix}.parquet"
+    return archive_root / symbol / f"{day.isoformat()}-{prefix}.parquet"
+
+
+_HOURLY_CHUNK_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(depth|quote)\.parquet$")
 
 
 def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
     """
-    For every symbol/table with hourly chunks under `day`, concatenate them
-    into one daily Parquet file, verify the row count, then delete the
-    hourly chunks. Symbols/tables with no chunks for `day` are skipped.
-    Safe to call more than once (e.g. after a retry) — already-merged
-    symbols simply have no hourly chunk dir left to find.
+    For every symbol with hourly chunks for `day`, concatenate them into one
+    daily Parquet file, drop the duplicate rows produced by the writer's
+    dual-write boundary overlap (see tick_writer.py — the last
+    DUAL_WRITE_SECONDS of ticks before
+    each hourly rollover are deliberately written to both the closing and
+    the next hour's file, so a boundary race can never silently drop a
+    tick), verify the resulting row count, then delete the hourly chunks.
+    Symbols with no chunks for `day` are skipped. Safe to call more than
+    once — already-merged symbols simply have no hourly chunks left to find.
     """
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:DAILY]"
@@ -302,22 +310,34 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
         if not symbol_dir.is_dir():
             continue
         symbol = symbol_dir.name
-        chunk_dir = symbol_dir / day.isoformat()
-        if not chunk_dir.exists():
-            continue
 
         for prefix in ("depth", "quote"):
-            chunks = sorted(chunk_dir.glob(f"*{prefix}.parquet"))
+            # Regex-filtered rather than a bare glob, so an already-merged
+            # daily file sitting in the same flat folder (e.g.
+            # 2026-07-31-quote.parquet, no hour digits) is never mistaken
+            # for an hourly chunk and re-merged into itself.
+            chunks = sorted(
+                p for p in symbol_dir.glob(f"{day.isoformat()}-*{prefix}.parquet")
+                if _HOURLY_CHUNK_RE.match(p.name)
+            )
             if not chunks:
                 continue
 
             try:
                 frames = [pd.read_parquet(c) for c in chunks]
                 src_count = sum(len(f) for f in frames)
-                merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+                concatenated = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             except Exception as exc:
                 print(f"{tag}[ERROR] read failed for {symbol}/{prefix}/{day}: {exc}", flush=True)
                 continue
+
+            # Full-row dedup: the boundary overlap writes the exact same
+            # row (identical timestamp, ingest_ns, raw_json) into both
+            # files, so an exact-duplicate match is the safest possible key
+            # — it can never accidentally collapse two genuinely different
+            # ticks that merely share a timestamp.
+            merged = concatenated.drop_duplicates(keep="first").reset_index(drop=True)
+            expected_dupes = len(concatenated) - len(merged)
 
             out_path = _daily_path(archive_root, prefix, symbol, day)
             try:
@@ -327,25 +347,22 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
                 print(f"{tag}[ERROR] write/verify failed for {symbol}/{prefix}/{day}: {exc}", flush=True)
                 continue
 
-            if written_count != src_count:
+            if written_count != src_count - expected_dupes:
                 print(
                     f"{tag}[ERROR] row count mismatch for {symbol}/{prefix}/{day}: "
-                    f"chunks={src_count} merged={written_count} — hourly chunks kept",
+                    f"chunks={src_count} dupes_dropped={expected_dupes} "
+                    f"merged={written_count} — hourly chunks kept",
                     flush=True,
                 )
                 continue
 
             for c in chunks:
                 c.unlink()
-            print(f"{tag} merged {symbol}/{prefix}/{day} ({written_count} rows) — hourly chunks removed", flush=True)
-
-        # Both depth and quote chunks share this one day directory now —
-        # only remove it once nothing (from either prefix) is left in it.
-        try:
-            if not any(chunk_dir.iterdir()):
-                chunk_dir.rmdir()
-        except OSError:
-            pass  # not empty (e.g. one prefix failed verification) — left for retry
+            print(
+                f"{tag} merged {symbol}/{prefix}/{day} ({written_count} rows, "
+                f"{expected_dupes} boundary duplicate(s) dropped) — hourly chunks removed",
+                flush=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +371,7 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
 
 def _iso_week_path(archive_root: Path, prefix: str, symbol: str, any_day_in_week: date) -> Path:
     iso_year, iso_week, _ = any_day_in_week.isocalendar()
-    return archive_root / symbol / f"{iso_year}-W{iso_week:02d}{prefix}.parquet"
+    return archive_root / symbol / f"{iso_year}-W{iso_week:02d}-{prefix}.parquet"
 
 
 def _days_in_iso_week(any_day_in_week: date) -> List[date]:
@@ -392,9 +409,9 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
 
         for prefix in ("depth", "quote"):
             daily_paths = [
-                symbol_dir / f"{d.isoformat()}{prefix}.parquet"
+                symbol_dir / f"{d.isoformat()}-{prefix}.parquet"
                 for d in week_days
-                if (symbol_dir / f"{d.isoformat()}{prefix}.parquet").exists()
+                if (symbol_dir / f"{d.isoformat()}-{prefix}.parquet").exists()
             ]
             if not daily_paths:
                 continue
