@@ -4,10 +4,9 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from x9_data_fetcher.depth_parquet_writer import DepthParquetWriter
 from x9_data_fetcher.event_bus import market_data_queue
 from x9_data_fetcher.market_time import tz_kolkata
-from x9_data_fetcher.ohlc_parquet_writer import OhlcParquetWriter
+from x9_data_fetcher.tick_writer import TickWriter
 
 try:
     from x9_data_fetcher.pg_writer import PgWriter
@@ -102,13 +101,15 @@ class MarketDataFetcher:
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
     ):
-        self.depth_writer = DepthParquetWriter(
+        self.depth_writer = TickWriter(
             base_dir=depth_output_dir,
+            prefix="depth",
             flush_batch_size=flush_batch_size,
             flush_interval_sec=flush_interval_sec,
         )
-        self.ohlc_writer = OhlcParquetWriter(
+        self.quote_writer = TickWriter(
             base_dir=quote_output_dir,
+            prefix="quote",
             flush_batch_size=flush_batch_size,
             flush_interval_sec=flush_interval_sec,
         )
@@ -156,7 +157,7 @@ class MarketDataFetcher:
                     quote_row = _extract_quote_row(packet)
                     if quote_row:
                         symbol = quote_row["symbol"]
-                        self.ohlc_writer.enqueue(symbol, quote_row)
+                        self.quote_writer.enqueue(symbol, quote_row)
                         if self.quote_pg_writer:
                             self.quote_pg_writer.enqueue(symbol, quote_row)
             finally:
@@ -172,7 +173,7 @@ class MarketDataFetcher:
         # crashed. SQLite writers poll every 0.25s so they exit almost
         # immediately; PG writers get longer since a real commit may be
         # mid-flight, but never wait indefinitely.
-        self.ohlc_writer.shutdown(timeout=5)
+        self.quote_writer.shutdown(timeout=5)
         self.depth_writer.shutdown(timeout=5)
         if self.quote_pg_writer:
             self.quote_pg_writer.shutdown(timeout=15)

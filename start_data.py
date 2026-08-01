@@ -422,7 +422,7 @@ async def run_engine():
         await asyncio.gather(*tasks, close_task, return_exceptions=True)
 
         # ── Daily close price — must run BEFORE fetcher.shutdown() so it
-        #    can enqueue through the still-running ohlc_writer (same
+        #    can enqueue through the still-running quote_writer (same
         #    quote_SYMBOL SQLite table live ticks go into). Natural close
         #    only — a manual stop mid-session has no real close price yet.
         if session_stop.is_set() and not manual_stop.is_set():
@@ -430,7 +430,7 @@ async def run_engine():
                 await DailyCloseManager(
                     symbols=symbols,
                     api_key=api_key,
-                ).run(fetcher.ohlc_writer, pg_configured)
+                ).run(fetcher.quote_writer, pg_configured)
             except Exception as exc:
                 print(f"[DAILY_CLOSE][ERROR] {exc}", flush=True)
 

@@ -625,9 +625,9 @@ class DailyCloseManager:
         apart, and nothing that assumes "every row is a live tick" (candle
         generation, gap detection, etc.) is fooled into treating it as one.
 
-    Must be called BEFORE the live SQLite writer (OhlcParquetWriter) is
-    shut down for the session — pass its still-running instance in via
-    `ohlc_writer` so this can enqueue through it normally rather than
+    Must be called BEFORE the live SQLite writer (TickWriter, prefix="quote")
+    is shut down for the session — pass its still-running instance in via
+    `quote_writer` so this can enqueue through it normally rather than
     opening a second, competing connection to the same DB file.
     """
 
@@ -655,7 +655,7 @@ class DailyCloseManager:
         self.flush_batch_size = flush_batch_size
         self.flush_interval_sec = flush_interval_sec
 
-    async def run(self, ohlc_writer, pg_configured: bool) -> None:
+    async def run(self, quote_writer, pg_configured: bool) -> None:
         try:
             if self.settle_delay_sec > 0:
                 print(
@@ -666,13 +666,13 @@ class DailyCloseManager:
                 await asyncio.sleep(self.settle_delay_sec)
             # blocking HTTP + SQLite/PG I/O — off the event loop, same as
             # BackfillManager, so nothing else in the shutdown sequence stalls
-            await asyncio.to_thread(self._run_once, ohlc_writer, pg_configured)
+            await asyncio.to_thread(self._run_once, quote_writer, pg_configured)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"[DAILY_CLOSE][ERROR] {exc}", flush=True)
 
-    def _run_once(self, ohlc_writer, pg_configured: bool) -> None:
+    def _run_once(self, quote_writer, pg_configured: bool) -> None:
         pg_writer: Optional[PgWriter] = None
         if pg_configured:
             pg_writer = PgWriter(
@@ -696,7 +696,7 @@ class DailyCloseManager:
                 else:
                     if pg_writer is not None:
                         pg_writer.enqueue(symbol, row)
-                    ohlc_writer.enqueue(symbol, row)
+                    quote_writer.enqueue(symbol, row)
                     written += 1
 
                 checked += 1
