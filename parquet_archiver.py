@@ -18,12 +18,13 @@ Design constraints this follows (see project notes):
     retried on the next pass — nothing is ever partially cleaned up.
 
 Layout produced:
-    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-<HH>depth.parquet   (hourly chunks)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-<HH>depth.parquet         (hourly chunks)
     <archive_root>/<SYMBOL>/<YYYY-MM-DD>-<HH>quote.parquet
-    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-depth.parquet        (after daily merge — deduped)
+    <archive_root>/<SYMBOL>/<YYYY-MM-DD>-depth.parquet              (after daily merge — deduped)
     <archive_root>/<SYMBOL>/<YYYY-MM-DD>-quote.parquet
-    <archive_root>/<SYMBOL>/<YYYY>-W<WW>-depth.parquet        (after weekly merge)
-    <archive_root>/<SYMBOL>/<YYYY>-W<WW>-quote.parquet
+    <archive_root>/<YYYY>-W<WW>/<SYMBOL>-<YYYY>-W<WW>-depth.parquet (after weekly merge — its
+    <archive_root>/<YYYY>-W<WW>/<SYMBOL>-<YYYY>-W<WW>-quote.parquet  own week folder, not the
+                                                                     symbol's folder)
 """
 
 import os
@@ -288,6 +289,12 @@ def _daily_path(archive_root: Path, prefix: str, symbol: str, day: date) -> Path
 
 _HOURLY_CHUNK_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(depth|quote)\.parquet$")
 
+# Weekly merges now live in archive_root/<YYYY-Www>/ folders, siblings of
+# the per-symbol folders directly under archive_root. Anything matching
+# this name is a week folder, not a symbol, and must be skipped wherever
+# archive_root's immediate children are assumed to all be symbols.
+_WEEK_FOLDER_RE = re.compile(r"^\d{4}-W\d{2}$")
+
 
 def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
     """
@@ -307,7 +314,7 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
         return
 
     for symbol_dir in sorted(archive_root.iterdir()):
-        if not symbol_dir.is_dir():
+        if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
             continue
         symbol = symbol_dir.name
 
@@ -371,7 +378,8 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
 
 def _iso_week_path(archive_root: Path, prefix: str, symbol: str, any_day_in_week: date) -> Path:
     iso_year, iso_week, _ = any_day_in_week.isocalendar()
-    return archive_root / symbol / f"{iso_year}-W{iso_week:02d}-{prefix}.parquet"
+    week_folder = f"{iso_year}-W{iso_week:02d}"
+    return archive_root / week_folder / f"{symbol}-{week_folder}-{prefix}.parquet"
 
 
 def _days_in_iso_week(any_day_in_week: date) -> List[date]:
@@ -403,7 +411,7 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
         return
 
     for symbol_dir in sorted(archive_root.iterdir()):
-        if not symbol_dir.is_dir():
+        if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
             continue
         symbol = symbol_dir.name
 
