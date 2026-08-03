@@ -282,7 +282,22 @@ class TickWriter:
                 next_conn = _open_db(next_db_path, self.tag)
                 next_known_tables = set()
                 pre_created = 0
-                for sym in known_tables:
+                # `known_tables` holds full table names (e.g. "quote_ABB"),
+                # not bare symbols — _ensure_table expects a bare symbol and
+                # re-applies the prefix itself. Passing the full table name
+                # straight through here used to double the prefix
+                # ("quote_quote_ABB"), and since that malformed name was
+                # never in next_known_tables, the real "quote_ABB" table
+                # then got created *again* later when actual ticks flushed
+                # in — doubling known_tables every hour and compounding
+                # from there.
+                table_prefix = f"{self.prefix}_"
+                for table_name in known_tables:
+                    sym = (
+                        table_name[len(table_prefix):]
+                        if table_name.startswith(table_prefix)
+                        else table_name
+                    )
                     _, created = _ensure_table(next_conn, sym, next_known_tables, self.prefix)
                     if created:
                         pre_created += 1

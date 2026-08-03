@@ -267,8 +267,17 @@ def run_once(force_all: bool = False) -> None:
             parsed = _parse_hourly_filename(db_path.name)
             if parsed is None:
                 continue
-            if not force_all and parsed == current_key:
-                continue  # still being written — never touch it
+            # >= rather than == : tick_writer.py now pre-opens and starts
+            # writing to the NEXT hour's file up to PRE_OPEN_SECONDS before
+            # the boundary (see tick_writer.py), so a file whose hour is
+            # still in the future relative to this process's clock can
+            # already be open and under active DDL from a live writer.
+            # Treating only an exact match as "still being written" left
+            # that pre-opened file unprotected and racing with the writer's
+            # own CREATE TABLE calls — the direct cause of a
+            # "database schema has changed" crash.
+            if not force_all and parsed >= current_key:
+                continue  # current hour, or a pre-opened future hour — never touch it
 
             if _archive_db_file(db_path, archive_root):
                 archived += 1
