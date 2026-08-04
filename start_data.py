@@ -286,16 +286,36 @@ async def run_engine():
         # Otherwise retention would happily hold 30 days of daily closes
         # while backfill only ever catches up the last 3 — days 4-30 of
         # any real downtime would silently never get filled in.
+        #
+        # Deliberately sequenced AFTER startup_backfill_task rather than
+        # launched at the same time: both hit the same broker history API
+        # with the same api_key, looping over every symbol. Run together —
+        # which used to happen every time this process starts after close,
+        # since backfill_missing_days correctly includes "today" the moment
+        # the market has closed — the two loops double up on concurrent
+        # requests to the broker right at startup. Daily closes are already
+        # -finalized data with zero urgency, so there's no cost to waiting
+        # for the tick-level backfill to finish first.
         _daily_min_days = max(
             1, int(os.getenv("X9_DAILY_BACKFILL_DAYS", "30").strip() or "30")
         )
         _daily_required_days = _last_n_trading_days(now_kolkata(), _daily_min_days)
-        daily_backfill_task = asyncio.create_task(
-            DailyCloseManager(symbols=symbols, api_key=api_key).run_backfill(
+
+        async def _run_daily_backfill_after_startup_backfill():
+            if startup_backfill_task is not None:
+                await asyncio.gather(startup_backfill_task, return_exceptions=True)
+            await DailyCloseManager(symbols=symbols, api_key=api_key).run_backfill(
                 _daily_required_days
             )
+
+        daily_backfill_task = asyncio.create_task(
+            _run_daily_backfill_after_startup_backfill()
         )
-        print("[X9_FETCHER] Startup daily-candle backfill task launched", flush=True)
+        print(
+            "[X9_FETCHER] Startup daily-candle backfill task launched "
+            "(queued to start once tick-level backfill finishes)",
+            flush=True,
+        )
     elif backfill_enabled:
         print("[BACKFILL] startup backfill skipped — PostgreSQL not configured", flush=True)
 
