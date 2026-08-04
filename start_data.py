@@ -339,6 +339,7 @@ async def run_engine():
         fetcher = MarketDataFetcher(
             depth_output_dir=depth_output_dir,
             quote_output_dir=quote_output_dir,
+            symbols=symbols,
             pg_dsn=pg_dsn,
             flush_batch_size=flush_batch,
             flush_interval_sec=flush_interval,

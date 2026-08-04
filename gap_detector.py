@@ -22,6 +22,7 @@ from x9_data_fetcher.market_time import (
 )
 from x9_data_fetcher.pg_writer import (
     _conn_params,
+    _safe_print,
     live_any_row_in_range,
     live_timestamps_for_range,
 )
@@ -345,10 +346,9 @@ def _find_symbol_gaps(
             # computed for this day, not once per symbol that reuses them.
             if log_windows and first_time_for_day:
                 for g in log_windows:
-                    print(
+                    _safe_print(
                         f"[GAP_DETECTOR] {day} LOG gap (all symbols): "
-                        f"{g[0].strftime('%H:%M')}->{g[1].strftime('%H:%M')}",
-                        flush=True,
+                        f"{g[0].strftime('%H:%M')}->{g[1].strftime('%H:%M')}"
                     )
             elif not log_windows and first_time_for_day:
                 # Log says "clean" - verify that's actually true before
@@ -356,12 +356,11 @@ def _find_symbol_gaps(
                 day_start_ms = int(session_start.timestamp() * 1000)
                 day_end_ms   = int(session_end.timestamp() * 1000)
                 if live_conn is None or not live_any_row_in_range(live_conn, day_start_ms, day_end_ms):
-                    print(
+                    _safe_print(
                         f"[GAP_DETECTOR][WARN] {day} connection log reports a clean "
                         "day, but zero rows exist for ANY symbol in that window "
                         "- overriding to a full-day gap (likely a silent auth "
-                        "failure that never triggered a logged disconnect)",
-                        flush=True,
+                        "failure that never triggered a logged disconnect)"
                     )
                     log_windows_cache[day] = [(session_start, session_end)]
                     log_windows = log_windows_cache[day]
@@ -383,9 +382,8 @@ def _find_symbol_gaps(
         )
 
         if not timestamps:
-            print(
-                f"[GAP_DETECTOR] {symbol} {day} - no data/log, fetching full session",
-                flush=True,
+            _safe_print(
+                f"[GAP_DETECTOR] {symbol} {day} - no data/log, fetching full session"
             )
             gaps.append((session_start, session_end))
             continue
@@ -393,17 +391,13 @@ def _find_symbol_gaps(
         day_gaps = _second_level_gaps(timestamps, session_start, session_end)
         if day_gaps:
             for g in day_gaps:
-                print(
+                _safe_print(
                     f"[GAP_DETECTOR] {symbol} {day} SCAN gap: "
-                    f"{g[0].strftime('%H:%M')}->{g[1].strftime('%H:%M')}",
-                    flush=True,
+                    f"{g[0].strftime('%H:%M')}->{g[1].strftime('%H:%M')}"
                 )
             gaps.extend(day_gaps)
         else:
-            print(
-                f"[GAP_DETECTOR] {symbol} {day} - data complete, skipping",
-                flush=True,
-            )
+            _safe_print(f"[GAP_DETECTOR] {symbol} {day} - data complete, skipping")
 
     return gaps
 

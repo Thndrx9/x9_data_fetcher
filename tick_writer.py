@@ -1,5 +1,6 @@
 import json
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -90,6 +91,11 @@ def _open_db(db_path: Path, tag: str) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not db_path.exists()
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    # Wait up to 5s for a momentary lock to clear instead of raising
+    # "database is locked" immediately — must be set before journal_mode,
+    # since enabling WAL itself briefly takes an exclusive lock and is
+    # exactly the kind of short-lived contention this is meant to absorb.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")    # batched disk writes
     conn.execute("PRAGMA synchronous=NORMAL")  # no fsync on every commit
     conn.execute("PRAGMA cache_size=500")      # 500 × 4 KB = 2 MB RAM
@@ -100,17 +106,36 @@ def _open_db(db_path: Path, tag: str) -> sqlite3.Connection:
     return conn
 
 
+_MALFORMED_TABLE_RE = re.compile(r"^(depth|quote)_\1")  # e.g. quote_quote..., depth_depth...
+
+
 def _load_existing_tables(conn: sqlite3.Connection, prefix: str, tag: str) -> Set[str]:
     """
     On startup or restart, read which <prefix>_* tables already exist in the
     DB. Prevents redundant CREATE TABLE calls for symbols already seen.
+
+    Tables matching a doubled prefix (quote_quote_..., depth_depth_...) are
+    a known artifact of a since-fixed bug in the pre-open step and are
+    quietly excluded here rather than propagated — carrying them into
+    known_tables would faithfully round-trip them into every future hourly
+    file forever (strip one layer, _ensure_table re-adds it, net no-op),
+    which is exactly what kept them alive across restarts after the
+    original fix stopped new ones from being created.
     """
     cur = conn.execute(
         f"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '{prefix}_%'"
     )
-    tables = {row[0] for row in cur.fetchall()}
+    all_names = {row[0] for row in cur.fetchall()}
+    tables = {name for name in all_names if not _MALFORMED_TABLE_RE.match(name)}
+    skipped = len(all_names) - len(tables)
     if tables:
         print(f"{tag} found {len(tables)} existing tables in DB", flush=True)
+    if skipped:
+        print(
+            f"{tag}[WARN] ignored {skipped} malformed table(s) with a "
+            f"doubled prefix (pre-existing corruption, not re-created)",
+            flush=True,
+        )
     return tables
 
 
@@ -181,7 +206,7 @@ class TickWriter:
     New symbols can be added mid-day or mid-week with no restart.
 
     Public interface:
-        writer = TickWriter(base_dir, prefix="depth")   # or prefix="quote"
+        writer = TickWriter(base_dir, prefix="depth", known_symbols=["ABB", "TCS"])
         writer.enqueue(symbol, row)
         writer.shutdown()
     """
@@ -190,6 +215,7 @@ class TickWriter:
         self,
         base_dir: str,
         prefix: str,
+        known_symbols=None,
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
     ):
@@ -203,6 +229,14 @@ class TickWriter:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.flush_batch_size   = max(1,   int(flush_batch_size))
         self.flush_interval_sec = max(0.2, float(flush_interval_sec))
+
+        # Canonical universe of symbols to pre-create tables for ahead of
+        # each rollover — driven directly from the configured symbol list,
+        # not reverse-parsed from existing table names. Only ever mutated
+        # from inside the writer thread (see _flush), so no lock needed.
+        self.known_symbols: Set[str] = (
+            {str(s).upper() for s in known_symbols} if known_symbols else set()
+        )
 
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -282,22 +316,17 @@ class TickWriter:
                 next_conn = _open_db(next_db_path, self.tag)
                 next_known_tables = set()
                 pre_created = 0
-                # `known_tables` holds full table names (e.g. "quote_ABB"),
-                # not bare symbols — _ensure_table expects a bare symbol and
-                # re-applies the prefix itself. Passing the full table name
-                # straight through here used to double the prefix
-                # ("quote_quote_ABB"), and since that malformed name was
-                # never in next_known_tables, the real "quote_ABB" table
-                # then got created *again* later when actual ticks flushed
-                # in — doubling known_tables every hour and compounding
-                # from there.
-                table_prefix = f"{self.prefix}_"
-                for table_name in known_tables:
-                    sym = (
-                        table_name[len(table_prefix):]
-                        if table_name.startswith(table_prefix)
-                        else table_name
-                    )
+                # Driven directly from self.known_symbols (the canonical
+                # symbol list) rather than reverse-parsed from existing
+                # table names — no bare-symbol extraction here means no way
+                # to reintroduce the doubled-prefix corruption a table-name
+                # parsing approach was previously vulnerable to. Also fixes
+                # a gap the table-name approach had: a symbol with no ticks
+                # yet this hour had no table to parse from, so it silently
+                # never got pre-created either — iterating the real symbol
+                # list instead means every configured symbol is pre-created
+                # every hour regardless of whether it's ticked yet.
+                for sym in self.known_symbols:
                     _, created = _ensure_table(next_conn, sym, next_known_tables, self.prefix)
                     if created:
                         pre_created += 1
@@ -325,20 +354,20 @@ class TickWriter:
             # already landed in whichever file turns out to be current.
             new_db_path = _hourly_db_path(self.base_dir, at=now_dt)
             if new_db_path != current_db_path:
-                self._flush(conn, buffered, known_tables, self.prefix, self.tag)
+                self._flush(conn, buffered, known_tables, self.prefix, self.tag, self.known_symbols)
                 conn.close()
 
                 if next_conn is not None and next_db_path == new_db_path:
                     # Normal path: the pre-opened connection is exactly the
                     # new current hour — hand it straight over.
-                    self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag)
+                    self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag, self.known_symbols)
                     conn = next_conn
                     known_tables = next_known_tables
                 else:
                     # Fallback (e.g. writer started < 60s before a boundary,
                     # so there was no time to pre-open): open fresh as before.
                     if next_conn is not None:
-                        self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag)
+                        self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag, self.known_symbols)
                         next_conn.close()
                     conn = _open_db(new_db_path, self.tag)
                     known_tables = _load_existing_tables(conn, self.prefix, self.tag)
@@ -374,16 +403,16 @@ class TickWriter:
             )
 
             if due_time or due_batch:
-                self._flush(conn, buffered, known_tables, self.prefix, self.tag)
+                self._flush(conn, buffered, known_tables, self.prefix, self.tag, self.known_symbols)
                 if next_conn is not None and next_buffered:
-                    self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag)
+                    self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag, self.known_symbols)
                 last_flush = now
 
         # final flush before exit
-        self._flush(conn, buffered, known_tables, self.prefix, self.tag)
+        self._flush(conn, buffered, known_tables, self.prefix, self.tag, self.known_symbols)
         conn.close()
         if next_conn is not None:
-            self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag)
+            self._flush(next_conn, next_buffered, next_known_tables, self.prefix, self.tag, self.known_symbols)
             next_conn.close()
 
     @staticmethod
@@ -393,6 +422,7 @@ class TickWriter:
         known_tables: Set[str],
         prefix: str,
         tag: str,
+        known_symbols: Set[str],
     ) -> None:
         """
         For each symbol:
@@ -400,6 +430,12 @@ class TickWriter:
           2. parse all buffered rows
           3. executemany into that symbol's table
         One commit at the end covers all symbols.
+
+        `known_symbols` is the canonical set future rollovers pre-create
+        tables from — any symbol seen here that isn't in it yet (e.g. a
+        genuinely new mid-day listing) gets added, so it's proactively
+        pre-created on future rollovers too, not just created reactively
+        on demand every time it happens to tick.
         """
         any_rows = False
         new_tables = 0
@@ -408,6 +444,7 @@ class TickWriter:
             if not rows:
                 continue
 
+            known_symbols.add(sym)
             table, created = _ensure_table(conn, sym, known_tables, prefix)
             if created:
                 new_tables += 1
