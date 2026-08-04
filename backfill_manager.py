@@ -41,6 +41,12 @@ from x9_data_fetcher.pg_writer import (
 # from this module.
 _CANDLE_INTERVAL_MS = 60_000
 
+# Round-based backfill retry tuning (see BackfillManager._run_once):
+# up to this many full passes over whatever's still pending, with this
+# pacing between every individual fetch call within a pass.
+MAX_BACKFILL_ROUNDS = 9
+FETCH_PACING_SEC = 0.5
+
 
 _IS_TTY = sys.stdout.isatty()
 _NON_TTY_PROGRESS_INTERVAL = 20  # print a plain line every N updates when not a live terminal
@@ -440,33 +446,114 @@ class BackfillManager:
         )
 
         # ── fetch and enqueue ─────────────────────────────────────────────
+        # Round-based retry: instead of hammering one symbol 3x back-to-back
+        # (bursty, noisy — every failing symbol dumped 3 stacked WARN lines
+        # before moving on), each round makes exactly ONE pass over every
+        # still-pending symbol, pacing calls FETCH_PACING_SEC apart. Symbols
+        # whose windows all returned candles are done and never retried;
+        # anything that had at least one empty/failed window that round goes
+        # into the next round's pending set — up to MAX_BACKFILL_ROUNDS
+        # total. If a round clears the whole pending set, remaining rounds
+        # are skipped. A symbol is retried as a whole (all its gap windows
+        # together) — already-successful windows for a still-pending symbol
+        # simply get queued again next round, which is harmless since
+        # PgWriter dedupes on timestamp.
         try:
             total_rows = 0
-            windows_done = 0
+            pending: Dict[str, Tuple[str, List[HistoryWindow]]] = dict(all_gaps)
+            last_failure_reason: Dict[str, str] = {}
+            round_num = 0
 
-            for symbol, (exchange, gaps) in all_gaps.items():
-                symbol_rows = 0
-                for window_start, window_end in gaps:
-                    candles = self._fetch_symbol_window(
-                        symbol, exchange, window_start, window_end
+            while pending and round_num < MAX_BACKFILL_ROUNDS:
+                round_num += 1
+                round_total = len(pending)
+                if round_num == 1:
+                    print(
+                        f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} — "
+                        f"sweeping {round_total} symbol(s)",
+                        flush=True,
                     )
-                    for candle in candles:
-                        self._writer.enqueue(symbol, candle)
-                    symbol_rows += len(candles)
-                    windows_done += 1
-                    _progress_write(
-                        f"[BACKFILL] fetching {windows_done}/{total_windows} window(s) "
-                        f"| {exchange}:{symbol} "
-                        f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
-                        f"{window_end.strftime('%H:%M')} "
-                        f"| {total_rows + symbol_rows} candle(s) queued so far",
-                        index=windows_done,
-                        total=total_windows,
+                else:
+                    print(
+                        f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} — "
+                        f"retrying {round_total} symbol(s) that failed round "
+                        f"{round_num - 1}",
+                        flush=True,
                     )
-                total_rows += symbol_rows
 
-            _progress_done()
+                still_pending: Dict[str, Tuple[str, List[HistoryWindow]]] = {}
+                round_success = 0
+                checked = 0
+
+                for symbol, (exchange, gaps) in pending.items():
+                    checked += 1
+                    symbol_failed = False
+                    symbol_rows = 0
+
+                    for window_start, window_end in gaps:
+                        candles, failure_reason = self._fetch_symbol_window(
+                            symbol, exchange, window_start, window_end
+                        )
+                        if candles:
+                            for candle in candles:
+                                self._writer.enqueue(symbol, candle)
+                            symbol_rows += len(candles)
+                            total_rows += len(candles)
+                        else:
+                            symbol_failed = True
+                            last_failure_reason[symbol] = failure_reason or "0 rows returned"
+
+                        _progress_write(
+                            f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} | "
+                            f"{checked}/{round_total} | {exchange}:{symbol} "
+                            f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
+                            f"{window_end.strftime('%H:%M')} "
+                            f"| {total_rows} candle(s) queued so far",
+                            index=checked,
+                            total=round_total,
+                        )
+
+                        # pace every single API call, not just between symbols
+                        time.sleep(FETCH_PACING_SEC)
+
+                    if symbol_failed:
+                        still_pending[symbol] = (exchange, gaps)
+                    else:
+                        last_failure_reason.pop(symbol, None)
+                        round_success += 1
+
+                _progress_done()
+                pending = still_pending
+
+                if pending:
+                    print(
+                        f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                        f"success={round_success} pending={len(pending)} "
+                        f"→ retrying pending in round {round_num + 1}"
+                        if round_num < MAX_BACKFILL_ROUNDS
+                        else f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                             f"success={round_success} pending={len(pending)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                        f"success={round_success} pending=0 → all recovered, stopping early",
+                        flush=True,
+                    )
+
             print(f"[BACKFILL] total {total_rows} candle(s) queued", flush=True)
+
+            if pending:
+                names = ", ".join(
+                    f"{exchange}:{symbol} ({last_failure_reason.get(symbol, 'unknown')})"
+                    for symbol, (exchange, _gaps) in pending.items()
+                )
+                print(
+                    f"[BACKFILL][WARN] {len(pending)} symbol(s) still failing after "
+                    f"{round_num} round(s): {names}",
+                    flush=True,
+                )
 
         finally:
             # shutdown inside the thread — thread.join() never reaches event loop
@@ -480,7 +567,18 @@ class BackfillManager:
         exchange: str,
         window_start: datetime,
         window_end: datetime,
-    ) -> List[dict]:
+    ) -> Tuple[List[dict], Optional[str]]:
+        """
+        Single attempt, no internal retry — retrying across attempts is now
+        the outer round-based loop's job (see _run_once), so this just makes
+        one call and reports what happened.
+
+        Returns (candles, failure_reason). failure_reason is None on
+        success; on failure it's a short human-readable string the caller
+        stashes for the final consolidated WARN if the symbol is still
+        failing after all rounds. Nothing is printed here — printing per
+        attempt is exactly the noise this refactor removes.
+        """
         now = now_kolkata()
 
         # When fetching today's data during market hours the OpenAlgo history
@@ -506,100 +604,52 @@ class BackfillManager:
         end_ms   = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
         # Tolerate APIs that stamp the candle close time instead of open time
         end_ms_tolerant = end_ms + _CANDLE_INTERVAL_MS
-        max_attempts = 3
-        last_response = ""
 
-        for attempt in range(1, max_attempts + 1):
-            http_request = request.Request(
-                self.endpoint,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            candles: List[dict] = []
-
-            try:
-                with request.urlopen(http_request, timeout=30) as response:
-                    raw_response = response.read().decode("utf-8")
-                    last_response = raw_response
-                    payload = json.loads(raw_response)
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-                if attempt < max_attempts:
-                    print(
-                        f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol} "
-                        f"(attempt {attempt}/{max_attempts}): {exc}; retrying in 1s",
-                        flush=True,
-                    )
-                    time.sleep(1)
-                    continue
-                print(
-                    f"[BACKFILL][WARN] fetch failed for {exchange}:{symbol}: {exc}",
-                    flush=True,
-                )
-                return []
-
-            rows = _extract_candle_rows(payload)
-            if not rows:
-                if attempt < max_attempts:
-                    print(
-                        f"[BACKFILL][WARN] API returned 0 rows for {exchange}:{symbol} "
-                        f"{window_start.strftime('%Y-%m-%d')} "
-                        f"(attempt {attempt}/{max_attempts}); retrying in 1s",
-                        flush=True,
-                    )
-                    time.sleep(1)
-                    continue
-                break
-
-            parsed_timestamps: List[int] = []
-            for row in rows:
-                ts_ms = _row_timestamp(row)
-                if ts_ms is None:
-                    continue
-                parsed_timestamps.append(ts_ms)
-                if ts_ms < start_ms or ts_ms > end_ms_tolerant:
-                    continue
-                normalized = _normalize_candle(row, symbol, exchange, self.interval)
-                if normalized:
-                    candles.append(normalized)
-
-            if candles:
-                return candles
-
-            if parsed_timestamps:
-                first     = _ms_to_ist(min(parsed_timestamps))
-                last      = _ms_to_ist(max(parsed_timestamps))
-                first_utc = datetime.fromtimestamp(min(parsed_timestamps) / 1000, tz=timezone.utc)
-                last_utc  = datetime.fromtimestamp(max(parsed_timestamps) / 1000, tz=timezone.utc)
-                print(
-                    f"[BACKFILL][WARN] {exchange}:{symbol} API returned {len(rows)} "
-                    f"row(s) but none matched gap "
-                    f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
-                    f"{window_end.strftime('%H:%M')} IST. "
-                    f"Response range: "
-                    f"{first.strftime('%Y-%m-%d %H:%M')}→{last.strftime('%H:%M')} IST "
-                    f"({first_utc.strftime('%Y-%m-%d %H:%M')}→"
-                    f"{last_utc.strftime('%H:%M')} UTC). "
-                    f"Broker may not have captured this period.",
-                    flush=True,
-                )
-                return []
-
-            print(
-                f"[BACKFILL][WARN] API returned {len(rows)} row(s) for "
-                f"{exchange}:{symbol}, but none had a readable timestamp",
-                flush=True,
-            )
-            return []
-
-        preview = last_response[:300] if len(last_response) > 300 else last_response
-        print(
-            f"[BACKFILL][WARN] API returned 0 rows for {exchange}:{symbol} "
-            f"{window_start.strftime('%Y-%m-%d')} after {max_attempts} attempts "
-            f"— response: {preview}",
-            flush=True,
+        http_request = request.Request(
+            self.endpoint,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        return []
+
+        try:
+            with request.urlopen(http_request, timeout=30) as response:
+                raw_response = response.read().decode("utf-8")
+                payload = json.loads(raw_response)
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return [], f"fetch error: {exc}"
+
+        rows = _extract_candle_rows(payload)
+        if not rows:
+            return [], "0 rows returned"
+
+        candles: List[dict] = []
+        parsed_timestamps: List[int] = []
+        for row in rows:
+            ts_ms = _row_timestamp(row)
+            if ts_ms is None:
+                continue
+            parsed_timestamps.append(ts_ms)
+            if ts_ms < start_ms or ts_ms > end_ms_tolerant:
+                continue
+            normalized = _normalize_candle(row, symbol, exchange, self.interval)
+            if normalized:
+                candles.append(normalized)
+
+        if candles:
+            return candles, None
+
+        if parsed_timestamps:
+            first = _ms_to_ist(min(parsed_timestamps))
+            last  = _ms_to_ist(max(parsed_timestamps))
+            return [], (
+                f"{len(rows)} row(s) returned but none matched gap window "
+                f"(response covered {first.strftime('%Y-%m-%d %H:%M')}→"
+                f"{last.strftime('%H:%M')} IST — broker may not have captured "
+                f"this period)"
+            )
+
+        return [], f"{len(rows)} row(s) returned but none had a readable timestamp"
 
 
 # ---------------------------------------------------------------------------
