@@ -122,8 +122,11 @@ async def websocket_client(
                     grouped.setdefault(ex, []).append(sym)
 
                 for ex, symbols in grouped.items():
+                    suffix = (
+                        " (same universe as Quote)" if mode_label == "Depth" else ""
+                    )
                     print(
-                        f"[WS] Subscribed {mode_label} {ex}:{','.join(symbols)}",
+                        f"[WS] Subscribed {mode_label} {ex}:{len(symbols)} symbols{suffix}",
                         flush=True,
                     )
 

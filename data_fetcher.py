@@ -97,19 +97,29 @@ class MarketDataFetcher:
         self,
         depth_output_dir: str,
         quote_output_dir: str,
+        symbols: list | None = None,
         pg_dsn: str | None = None,
         flush_batch_size: int = 200,
         flush_interval_sec: float = 1.0,
     ):
+        # `symbols` is the canonical list loaded from symbols.csv (list of
+        # {"exchange", "symbol"} dicts) — extract the bare symbol strings
+        # and hand them to both writers so every configured symbol gets a
+        # table pre-created ahead of each hourly rollover, not just
+        # whichever symbols happened to already have a table this hour.
+        symbol_names = [s["symbol"] for s in symbols] if symbols else None
+
         self.depth_writer = TickWriter(
             base_dir=depth_output_dir,
             prefix="depth",
+            known_symbols=symbol_names,
             flush_batch_size=flush_batch_size,
             flush_interval_sec=flush_interval_sec,
         )
         self.quote_writer = TickWriter(
             base_dir=quote_output_dir,
             prefix="quote",
+            known_symbols=symbol_names,
             flush_batch_size=flush_batch_size,
             flush_interval_sec=flush_interval_sec,
         )
