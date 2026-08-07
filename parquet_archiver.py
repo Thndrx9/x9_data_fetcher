@@ -36,7 +36,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -55,6 +55,17 @@ _HOURLY_FILE_RE = re.compile(r"^market_(\d{4}-\d{2}-\d{2})_(\d{2})\.db$")
 _TABLE_RE = re.compile(r"^(depth|quote)_(.+)$")
 
 COMPRESSION = "zstd"
+
+# Round-based retry for merge_daily/merge_weekly (see each function). Kept
+# much lower than backfill_manager.py's MAX_BACKFILL_ROUNDS=9: that one
+# retries flaky NETWORK calls to a broker, where a later attempt
+# genuinely has a good chance of succeeding. A merge failure here is
+# local disk I/O (Parquet write, then read back to verify) — a write
+# error or row-count mismatch is far more likely to be a real, persistent
+# problem (disk full, corrupted chunk, permissions) than something that
+# clears up between attempts, so there's little value in hammering it 9
+# times.
+MERGE_MAX_ROUNDS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +316,60 @@ _HOURLY_CHUNK_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})(depth|quote)\.parqu
 _WEEK_FOLDER_RE = re.compile(r"^\d{4}-W\d{2}$")
 
 
+def _merge_daily_one(
+    symbol_dir: Path, symbol: str, prefix: str, day: date, archive_root: Path
+) -> Tuple[str, object]:
+    """
+    Attempt to merge one symbol/prefix's hourly chunks for `day` into the
+    daily file. Returns (status, info):
+      - ("no_chunks", None)             — nothing to merge, not a failure
+      - ("merged", (written_count, expected_dupes)) — success
+      - ("failed", reason_str)          — caller decides whether to retry
+    """
+    # Regex-filtered rather than a bare glob, so an already-merged daily
+    # file sitting in the same flat folder (e.g. 2026-07-31-quote.parquet,
+    # no hour digits) is never mistaken for an hourly chunk and re-merged
+    # into itself.
+    chunks = sorted(
+        p for p in symbol_dir.glob(f"{day.isoformat()}-*{prefix}.parquet")
+        if _HOURLY_CHUNK_RE.match(p.name)
+    )
+    if not chunks:
+        return "no_chunks", None
+
+    try:
+        frames = [pd.read_parquet(c) for c in chunks]
+        src_count = sum(len(f) for f in frames)
+        concatenated = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    except Exception as exc:
+        return "failed", f"read failed: {exc}"
+
+    # Full-row dedup: the boundary overlap writes the exact same row
+    # (identical timestamp, ingest_ns, raw_json) into both files, so an
+    # exact-duplicate match is the safest possible key — it can never
+    # accidentally collapse two genuinely different ticks that merely
+    # share a timestamp.
+    merged = concatenated.drop_duplicates(keep="first").reset_index(drop=True)
+    expected_dupes = len(concatenated) - len(merged)
+
+    out_path = _daily_path(archive_root, prefix, symbol, day)
+    try:
+        _write_parquet(merged, out_path)
+        written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
+    except Exception as exc:
+        return "failed", f"write/verify failed: {exc}"
+
+    if written_count != src_count - expected_dupes:
+        return "failed", (
+            f"row count mismatch: chunks={src_count} "
+            f"dupes_dropped={expected_dupes} merged={written_count}"
+        )
+
+    for c in chunks:
+        c.unlink()
+    return "merged", (written_count, expected_dupes)
+
+
 def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
     """
     For every symbol with hourly chunks for `day`, concatenate them into one
@@ -316,69 +381,122 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
     tick), verify the resulting row count, then delete the hourly chunks.
     Symbols with no chunks for `day` are skipped. Safe to call more than
     once — already-merged symbols simply have no hourly chunks left to find.
+
+    Round-based retry, same shape as backfill_manager.py's BackfillManager
+    — each round retries only the (symbol, prefix) pairs that failed the
+    previous round, up to MERGE_MAX_ROUNDS. Per-item success is silent;
+    one summary line is printed at the end instead of one line per pair
+    (this used to print one "merged ..." line per symbol per prefix — up
+    to ~400 lines/day for 200 symbols).
     """
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:DAILY]"
     if not archive_root.exists():
         return
 
+    # Build the initial pending set — every (symbol, prefix) pair that
+    # actually has hourly chunks for `day`. No chunks means nothing to
+    # merge for that pair, so it's never added and never counted as
+    # pending/failed.
+    items: List[Tuple[str, str]] = []
     for symbol_dir in sorted(archive_root.iterdir()):
         if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
             continue
         symbol = symbol_dir.name
-
         for prefix in ("depth", "quote"):
-            # Regex-filtered rather than a bare glob, so an already-merged
-            # daily file sitting in the same flat folder (e.g.
-            # 2026-07-31-quote.parquet, no hour digits) is never mistaken
-            # for an hourly chunk and re-merged into itself.
-            chunks = sorted(
-                p for p in symbol_dir.glob(f"{day.isoformat()}-*{prefix}.parquet")
-                if _HOURLY_CHUNK_RE.match(p.name)
+            has_chunks = any(
+                _HOURLY_CHUNK_RE.match(p.name)
+                for p in symbol_dir.glob(f"{day.isoformat()}-*{prefix}.parquet")
             )
-            if not chunks:
-                continue
+            if has_chunks:
+                items.append((symbol, prefix))
 
-            try:
-                frames = [pd.read_parquet(c) for c in chunks]
-                src_count = sum(len(f) for f in frames)
-                concatenated = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-            except Exception as exc:
-                print(f"{tag}[ERROR] read failed for {symbol}/{prefix}/{day}: {exc}", flush=True)
-                continue
+    if not items:
+        return
 
-            # Full-row dedup: the boundary overlap writes the exact same
-            # row (identical timestamp, ingest_ns, raw_json) into both
-            # files, so an exact-duplicate match is the safest possible key
-            # — it can never accidentally collapse two genuinely different
-            # ticks that merely share a timestamp.
-            merged = concatenated.drop_duplicates(keep="first").reset_index(drop=True)
-            expected_dupes = len(concatenated) - len(merged)
+    merged_total = 0
+    rows_total = 0
+    dupes_total = 0
+    last_failure_reason: Dict[Tuple[str, str], str] = {}
+    round_num = 0
 
-            out_path = _daily_path(archive_root, prefix, symbol, day)
-            try:
-                _write_parquet(merged, out_path)
-                written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
-            except Exception as exc:
-                print(f"{tag}[ERROR] write/verify failed for {symbol}/{prefix}/{day}: {exc}", flush=True)
-                continue
-
-            if written_count != src_count - expected_dupes:
-                print(
-                    f"{tag}[ERROR] row count mismatch for {symbol}/{prefix}/{day}: "
-                    f"chunks={src_count} dupes_dropped={expected_dupes} "
-                    f"merged={written_count} — hourly chunks kept",
-                    flush=True,
-                )
-                continue
-
-            for c in chunks:
-                c.unlink()
+    while items and round_num < MERGE_MAX_ROUNDS:
+        round_num += 1
+        round_total = len(items)
+        if round_num == 1:
             print(
-                f"{tag} merged {symbol}/{prefix}/{day} ({written_count} rows, "
-                f"{expected_dupes} boundary duplicate(s) dropped) — hourly chunks removed",
+                f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} — "
+                f"merging {round_total} symbol/prefix pair(s)",
                 flush=True,
             )
+        else:
+            print(
+                f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} — "
+                f"retrying {round_total} pair(s) that failed round {round_num - 1}",
+                flush=True,
+            )
+
+        still_pending: List[Tuple[str, str]] = []
+        round_success = 0
+
+        for symbol, prefix in items:
+            symbol_dir = archive_root / symbol
+            status, info = _merge_daily_one(symbol_dir, symbol, prefix, day, archive_root)
+            if status == "merged":
+                written_count, dupes = info
+                merged_total += 1
+                rows_total += written_count
+                dupes_total += dupes
+                last_failure_reason.pop((symbol, prefix), None)
+                round_success += 1
+            elif status == "no_chunks":
+                # Shouldn't happen given the up-front filter, but treat as
+                # done rather than pending if a chunk vanishes mid-pass.
+                round_success += 1
+            else:
+                still_pending.append((symbol, prefix))
+                last_failure_reason[(symbol, prefix)] = str(info)
+
+        items = still_pending
+        if items:
+            if round_num < MERGE_MAX_ROUNDS:
+                print(
+                    f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} done — "
+                    f"success={round_success} pending={len(items)} "
+                    f"→ retrying pending in round {round_num + 1}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} done — "
+                    f"success={round_success} pending={len(items)}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} done — "
+                f"success={round_success} pending=0 → all recovered, stopping early",
+                flush=True,
+            )
+
+    summary = (
+        f"{tag} merge complete — {merged_total} merged ({rows_total} rows, "
+        f"{dupes_total} boundary duplicate(s) dropped)"
+    )
+    if items:
+        summary += f", {len(items)} still failing"
+    print(summary, flush=True)
+
+    if items:
+        names = ", ".join(
+            f"{symbol}/{prefix} ({last_failure_reason.get((symbol, prefix), 'unknown')})"
+            for symbol, prefix in items
+        )
+        print(
+            f"{tag}[WARN] {len(items)} pair(s) still failing after "
+            f"{round_num} round(s), hourly chunks kept: {names}",
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +522,48 @@ def is_last_trading_day_of_week(day: date) -> bool:
     return True
 
 
+def _merge_weekly_one(
+    symbol_dir: Path,
+    symbol: str,
+    prefix: str,
+    week_days: List[date],
+    archive_root: Path,
+    any_day_in_week: date,
+) -> Tuple[str, object]:
+    """
+    Attempt to merge one symbol/prefix's daily files for the week into the
+    weekly file. Same (status, info) contract as _merge_daily_one.
+    """
+    daily_paths = [
+        symbol_dir / f"{d.isoformat()}-{prefix}.parquet"
+        for d in week_days
+        if (symbol_dir / f"{d.isoformat()}-{prefix}.parquet").exists()
+    ]
+    if not daily_paths:
+        return "no_chunks", None
+
+    try:
+        frames = [pd.read_parquet(p) for p in daily_paths]
+        src_count = sum(len(f) for f in frames)
+        merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    except Exception as exc:
+        return "failed", f"read failed: {exc}"
+
+    out_path = _iso_week_path(archive_root, prefix, symbol, any_day_in_week)
+    try:
+        _write_parquet(merged, out_path)
+        written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
+    except Exception as exc:
+        return "failed", f"write/verify failed: {exc}"
+
+    if written_count != src_count:
+        return "failed", f"row count mismatch: dailies={src_count} merged={written_count}"
+
+    for p in daily_paths:
+        p.unlink()
+    return "merged", written_count
+
+
 def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> None:
     """
     For every symbol/table with daily files in any_day_in_week's ISO week,
@@ -411,6 +571,8 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
     daily files. Intended to be called on the last trading day of the week
     (see is_last_trading_day_of_week) — but merges whatever daily files
     exist for the week regardless of which day it's called on.
+
+    Same round-based retry + single summary line as merge_daily.
     """
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:WEEKLY]"
@@ -419,47 +581,99 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
     if not archive_root.exists():
         return
 
+    items: List[Tuple[str, str]] = []
     for symbol_dir in sorted(archive_root.iterdir()):
         if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
             continue
         symbol = symbol_dir.name
-
         for prefix in ("depth", "quote"):
-            daily_paths = [
-                symbol_dir / f"{d.isoformat()}-{prefix}.parquet"
+            has_dailies = any(
+                (symbol_dir / f"{d.isoformat()}-{prefix}.parquet").exists()
                 for d in week_days
-                if (symbol_dir / f"{d.isoformat()}-{prefix}.parquet").exists()
-            ]
-            if not daily_paths:
-                continue
+            )
+            if has_dailies:
+                items.append((symbol, prefix))
 
-            try:
-                frames = [pd.read_parquet(p) for p in daily_paths]
-                src_count = sum(len(f) for f in frames)
-                merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-            except Exception as exc:
-                print(f"{tag}[ERROR] read failed for {symbol}/{prefix}: {exc}", flush=True)
-                continue
+    if not items:
+        return
 
-            out_path = _iso_week_path(archive_root, prefix, symbol, any_day_in_week)
-            try:
-                _write_parquet(merged, out_path)
-                written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
-            except Exception as exc:
-                print(f"{tag}[ERROR] write/verify failed for {symbol}/{prefix}: {exc}", flush=True)
-                continue
+    merged_total = 0
+    rows_total = 0
+    last_failure_reason: Dict[Tuple[str, str], str] = {}
+    round_num = 0
 
-            if written_count != src_count:
+    while items and round_num < MERGE_MAX_ROUNDS:
+        round_num += 1
+        round_total = len(items)
+        if round_num == 1:
+            print(
+                f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} — "
+                f"merging {round_total} symbol/prefix pair(s)",
+                flush=True,
+            )
+        else:
+            print(
+                f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} — "
+                f"retrying {round_total} pair(s) that failed round {round_num - 1}",
+                flush=True,
+            )
+
+        still_pending: List[Tuple[str, str]] = []
+        round_success = 0
+
+        for symbol, prefix in items:
+            symbol_dir = archive_root / symbol
+            status, info = _merge_weekly_one(
+                symbol_dir, symbol, prefix, week_days, archive_root, any_day_in_week
+            )
+            if status == "merged":
+                merged_total += 1
+                rows_total += info
+                last_failure_reason.pop((symbol, prefix), None)
+                round_success += 1
+            elif status == "no_chunks":
+                round_success += 1
+            else:
+                still_pending.append((symbol, prefix))
+                last_failure_reason[(symbol, prefix)] = str(info)
+
+        items = still_pending
+        if items:
+            if round_num < MERGE_MAX_ROUNDS:
                 print(
-                    f"{tag}[ERROR] row count mismatch for {symbol}/{prefix}: "
-                    f"dailies={src_count} merged={written_count} — daily files kept",
+                    f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} done — "
+                    f"success={round_success} pending={len(items)} "
+                    f"→ retrying pending in round {round_num + 1}",
                     flush=True,
                 )
-                continue
+            else:
+                print(
+                    f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} done — "
+                    f"success={round_success} pending={len(items)}",
+                    flush=True,
+                )
+        else:
+            print(
+                f"{tag} round {round_num}/{MERGE_MAX_ROUNDS} done — "
+                f"success={round_success} pending=0 → all recovered, stopping early",
+                flush=True,
+            )
 
-            for p in daily_paths:
-                p.unlink()
-            print(f"{tag} merged {prefix}/{symbol} ({written_count} rows) — daily files removed", flush=True)
+    summary = f"{tag} merge complete — {merged_total} merged ({rows_total} rows)"
+    if items:
+        summary += f", {len(items)} still failing"
+    print(summary, flush=True)
+
+    if items:
+        names = ", ".join(
+            f"{symbol}/{prefix} ({last_failure_reason.get((symbol, prefix), 'unknown')})"
+            for symbol, prefix in items
+        )
+        print(
+            f"{tag}[WARN] {len(items)} pair(s) still failing after "
+            f"{round_num} round(s), daily files kept: {names}",
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
