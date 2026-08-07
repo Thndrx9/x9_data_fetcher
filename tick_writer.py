@@ -86,24 +86,87 @@ def _seconds_to_next_hour(now: "datetime | None" = None) -> float:
     return (next_hour - now).total_seconds()
 
 
+# Quote and Depth run as two independent TickWriter threads, and by
+# default they point at the SAME base_dir (X9_QUOTE_OUTPUT_DIR and
+# X9_DEPTH_OUTPUT_DIR both default to "data") — so they share the exact
+# same hourly file, one writing quote_* tables, the other depth_* tables.
+# Creating a brand-new SQLite file and flipping it into WAL mode briefly
+# needs an exclusive lock; if both threads hit _open_db() for the same
+# not-yet-existing file at nearly the same instant (both pre-open the next
+# hour's file at T-60s independently), that's a real race that can outlast
+# even a 5s busy_timeout and raise "database is locked".
+#
+# Fix: coordinate by resolved file path. Whichever thread gets here first
+# does the actual create + WAL-enable and signals an Event when done; the
+# other thread waits for that Event instead of racing to also create/init
+# the same file, then opens its own ordinary connection to the now-ready
+# file. If Quote and Depth are ever pointed at different directories, the
+# paths simply never collide and this is a no-op for both.
+_open_lock = threading.Lock()
+_open_events: Dict[Path, threading.Event] = {}
+
+
 def _open_db(db_path: Path, tag: str) -> sqlite3.Connection:
-    """Open (or create) the hourly SQLite file and set performance pragmas."""
+    """Open (or create) the hourly SQLite file and set performance pragmas.
+
+    Safe to call concurrently, from different threads, for the same path —
+    only the first caller creates the file and enables WAL; any other
+    caller for that same path waits for it, then opens its own connection.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not db_path.exists()
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    # Wait up to 5s for a momentary lock to clear instead of raising
-    # "database is locked" immediately — must be set before journal_mode,
-    # since enabling WAL itself briefly takes an exclusive lock and is
-    # exactly the kind of short-lived contention this is meant to absorb.
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")    # batched disk writes
-    conn.execute("PRAGMA synchronous=NORMAL")  # no fsync on every commit
-    conn.execute("PRAGMA cache_size=500")      # 500 × 4 KB = 2 MB RAM
-    conn.execute("PRAGMA page_size=4096")
-    conn.commit()
-    action = "created" if is_new else "opened"
-    print(f"{tag} DB {action}: {db_path.name}", flush=True)
-    return conn
+    resolved = db_path.resolve()
+
+    with _open_lock:
+        event = _open_events.get(resolved)
+        is_first = event is None
+        if is_first:
+            event = threading.Event()
+            _open_events[resolved] = event
+
+    if not is_first:
+        # Another writer (Quote or Depth) is creating/initializing this
+        # exact file right now — wait for it rather than racing the same
+        # CREATE + WAL-enable ourselves. journal_mode is a property of the
+        # file itself once set, so once the first connection has enabled
+        # WAL, every later connection to this file is already in WAL mode.
+        ready = event.wait(timeout=10)
+        if not ready:
+            print(
+                f"{tag}[WARN] timed out waiting for sibling writer to "
+                f"finish creating {db_path.name} — opening independently",
+                flush=True,
+            )
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=500")
+        conn.execute("PRAGMA page_size=4096")
+        conn.commit()
+        print(f"{tag} DB opened: {db_path.name}", flush=True)
+        return conn
+
+    try:
+        is_new = not db_path.exists()
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # Wait up to 5s for a momentary lock to clear instead of raising
+        # "database is locked" immediately — must be set before
+        # journal_mode, since enabling WAL itself briefly takes an
+        # exclusive lock and is exactly the kind of short-lived
+        # contention this is meant to absorb.
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")    # batched disk writes
+        conn.execute("PRAGMA synchronous=NORMAL")  # no fsync on every commit
+        conn.execute("PRAGMA cache_size=500")      # 500 × 4 KB = 2 MB RAM
+        conn.execute("PRAGMA page_size=4096")
+        conn.commit()
+        action = "created" if is_new else "opened"
+        print(f"{tag} DB {action}: {db_path.name}", flush=True)
+        return conn
+    finally:
+        # Signal any waiting sibling regardless of outcome — an exception
+        # here must not leave the other writer's thread hanging forever.
+        event.set()
 
 
 _MALFORMED_TABLE_RE = re.compile(r"^(depth|quote)_\1")  # e.g. quote_quote..., depth_depth...

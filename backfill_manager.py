@@ -45,7 +45,45 @@ _CANDLE_INTERVAL_MS = 60_000
 # up to this many full passes over whatever's still pending, with this
 # pacing between every individual fetch call within a pass.
 MAX_BACKFILL_ROUNDS = 9
+
+# A symbol's gap windows get grouped and fetched with ONE broker call per
+# group instead of one call per window, whenever a group's overall span
+# (earliest window's start date to latest window's end date) fits within
+# this many days. The broker's history endpoint is already day-granular
+# regardless of how narrow a window is (start_date/end_date, not minute
+# timestamps) — two windows on the same day, or a few days apart, cost the
+# exact same one call either way, so there is no reason to fetch that span
+# twice. Kept as a threshold rather than always merging everything for one
+# symbol: a stray gap weeks away from the rest would otherwise drag a huge,
+# mostly-unwanted date range into a single request just to patch one
+# unrelated window.
+WINDOW_MERGE_MAX_SPAN_DAYS = 5
 FETCH_PACING_SEC = 0.5
+
+
+def _group_windows_for_merge(gaps: List[HistoryWindow]) -> List[List[HistoryWindow]]:
+    """
+    Cluster one symbol's gap windows into groups that can each be fetched
+    with a single broker call — see WINDOW_MERGE_MAX_SPAN_DAYS. Greedy:
+    windows are sorted by start time, and each is added to the current
+    group as long as doing so keeps that group's overall span (earliest
+    start date to latest end date) within the threshold; otherwise it
+    starts a new group.
+    """
+    if not gaps:
+        return []
+    ordered = sorted(gaps, key=lambda w: w[0])
+    groups: List[List[HistoryWindow]] = [[ordered[0]]]
+    group_start_date = ordered[0][0].date()
+    for window in ordered[1:]:
+        candidate_end_date = max(group_start_date, window[1].date())
+        span_days = (candidate_end_date - group_start_date).days
+        if span_days <= WINDOW_MERGE_MAX_SPAN_DAYS:
+            groups[-1].append(window)
+        else:
+            groups.append([window])
+            group_start_date = window[0].date()
+    return groups
 
 
 _IS_TTY = sys.stdout.isatty()
@@ -490,30 +528,47 @@ class BackfillManager:
                     symbol_failed = False
                     symbol_rows = 0
 
-                    for window_start, window_end in gaps:
-                        candles, failure_reason = self._fetch_symbol_window(
-                            symbol, exchange, window_start, window_end
-                        )
-                        if candles:
-                            for candle in candles:
-                                self._writer.enqueue(symbol, candle)
-                            symbol_rows += len(candles)
-                            total_rows += len(candles)
+                    # Windows close enough together (see
+                    # WINDOW_MERGE_MAX_SPAN_DAYS) share ONE broker call
+                    # instead of one call each — the broker's response for
+                    # a wider date range already covers every window inside
+                    # it, so a second call for a nearby window would just
+                    # be re-fetching data the first call already got.
+                    for group in _group_windows_for_merge(gaps):
+                        if len(group) == 1:
+                            window_start, window_end = group[0]
+                            window_results = {
+                                group[0]: self._fetch_symbol_window(
+                                    symbol, exchange, window_start, window_end
+                                )
+                            }
                         else:
-                            symbol_failed = True
-                            last_failure_reason[symbol] = failure_reason or "0 rows returned"
+                            window_results = self._fetch_symbol_windows_merged(
+                                symbol, exchange, group
+                            )
 
-                        _progress_write(
-                            f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} | "
-                            f"{checked}/{round_total} | {exchange}:{symbol} "
-                            f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
-                            f"{window_end.strftime('%H:%M')} "
-                            f"| {total_rows} candle(s) queued so far",
-                            index=checked,
-                            total=round_total,
-                        )
+                        for (window_start, window_end), (candles, failure_reason) in window_results.items():
+                            if candles:
+                                for candle in candles:
+                                    self._writer.enqueue(symbol, candle)
+                                symbol_rows += len(candles)
+                                total_rows += len(candles)
+                            else:
+                                symbol_failed = True
+                                last_failure_reason[symbol] = failure_reason or "0 rows returned"
 
-                        # pace every single API call, not just between symbols
+                            _progress_write(
+                                f"[BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} | "
+                                f"{checked}/{round_total} | {exchange}:{symbol} "
+                                f"{window_start.strftime('%Y-%m-%d %H:%M')}→"
+                                f"{window_end.strftime('%H:%M')} "
+                                f"| {total_rows} candle(s) queued so far",
+                                index=checked,
+                                total=round_total,
+                            )
+
+                        # pace once per broker call (one per group, not one
+                        # per window inside it)
                         time.sleep(FETCH_PACING_SEC)
 
                     if symbol_failed:
@@ -561,49 +616,45 @@ class BackfillManager:
             self._writer.shutdown()
             self._writer = None
 
-    def _fetch_symbol_window(
+    def _fetch_raw_rows(
         self,
         symbol: str,
         exchange: str,
-        window_start: datetime,
-        window_end: datetime,
+        range_start_date: date,
+        range_end_date: date,
     ) -> Tuple[List[dict], Optional[str]]:
         """
-        Single attempt, no internal retry — retrying across attempts is now
-        the outer round-based loop's job (see _run_once), so this just makes
-        one call and reports what happened.
+        Single HTTP call spanning [range_start_date, range_end_date]
+        (inclusive), unfiltered — returns whatever raw candle rows the
+        broker sends back for that whole span. Shared by both the
+        single-window path and the merged-multi-window path below; the
+        only difference between fetching one narrow window and fetching
+        several nearby ones is how many windows get sliced out of this
+        same response afterward.
 
-        Returns (candles, failure_reason). failure_reason is None on
-        success; on failure it's a short human-readable string the caller
-        stashes for the final consolidated WARN if the symbol is still
-        failing after all rounds. Nothing is printed here — printing per
-        attempt is exactly the noise this refactor removes.
+        Returns (rows, failure_reason). failure_reason is None only when
+        rows is non-empty.
         """
         now = now_kolkata()
 
         # When fetching today's data during market hours the OpenAlgo history
         # API requires end_date = tomorrow to return the live/partial session.
         # For past dates end_date == the date itself is correct.
-        if window_start.date() == now.date() and is_market_open(now):
-            from datetime import timedelta as _td
-            api_end_date = (window_end.date() + _td(days=1)).strftime("%Y-%m-%d")
+        if range_end_date == now.date() and is_market_open(now):
+            api_end_date = (range_end_date + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
-            api_end_date = window_end.strftime("%Y-%m-%d")
+            api_end_date = range_end_date.strftime("%Y-%m-%d")
 
         body = {
             "apikey":     self.api_key,
             "symbol":     symbol,
             "exchange":   exchange,
             "interval":   self.interval,
-            "start_date": window_start.strftime("%Y-%m-%d"),
+            "start_date": range_start_date.strftime("%Y-%m-%d"),
             "end_date":   api_end_date,
             "source":     "api",
         }
-        data     = json.dumps(body).encode("utf-8")
-        start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
-        end_ms   = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
-        # Tolerate APIs that stamp the candle close time instead of open time
-        end_ms_tolerant = end_ms + _CANDLE_INTERVAL_MS
+        data = json.dumps(body).encode("utf-8")
 
         http_request = request.Request(
             self.endpoint,
@@ -622,6 +673,21 @@ class BackfillManager:
         rows = _extract_candle_rows(payload)
         if not rows:
             return [], "0 rows returned"
+        return rows, None
+
+    def _filter_window(
+        self,
+        rows: List[dict],
+        symbol: str,
+        exchange: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Tuple[List[dict], Optional[str]]:
+        """Slice/normalize already-fetched raw rows down to one window."""
+        start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
+        end_ms   = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
+        # Tolerate APIs that stamp the candle close time instead of open time
+        end_ms_tolerant = end_ms + _CANDLE_INTERVAL_MS
 
         candles: List[dict] = []
         parsed_timestamps: List[int] = []
@@ -650,6 +716,55 @@ class BackfillManager:
             )
 
         return [], f"{len(rows)} row(s) returned but none had a readable timestamp"
+
+    def _fetch_symbol_window(
+        self,
+        symbol: str,
+        exchange: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> Tuple[List[dict], Optional[str]]:
+        """
+        Single attempt, no internal retry — retrying across attempts is now
+        the outer round-based loop's job (see run()), so this just makes
+        one call and reports what happened.
+
+        Returns (candles, failure_reason). failure_reason is None on
+        success; on failure it's a short human-readable string the caller
+        stashes for the final consolidated WARN if the symbol is still
+        failing after all rounds. Nothing is printed here — printing per
+        attempt is exactly the noise this refactor removes.
+        """
+        rows, err = self._fetch_raw_rows(symbol, exchange, window_start.date(), window_end.date())
+        if not rows:
+            return [], err
+        return self._filter_window(rows, symbol, exchange, window_start, window_end)
+
+    def _fetch_symbol_windows_merged(
+        self,
+        symbol: str,
+        exchange: str,
+        windows: List[HistoryWindow],
+    ) -> Dict[HistoryWindow, Tuple[List[dict], Optional[str]]]:
+        """
+        One HTTP call spanning every window's combined date range, then
+        sliced back out per window — see _group_windows_for_merge for when
+        this gets used instead of one _fetch_symbol_window call per window.
+        """
+        range_start_date = min(w[0].date() for w in windows)
+        range_end_date   = max(w[1].date() for w in windows)
+        rows, err = self._fetch_raw_rows(symbol, exchange, range_start_date, range_end_date)
+
+        results: Dict[HistoryWindow, Tuple[List[dict], Optional[str]]] = {}
+        if not rows:
+            for w in windows:
+                results[w] = ([], err)
+            return results
+
+        for w in windows:
+            window_start, window_end = w
+            results[w] = self._filter_window(rows, symbol, exchange, window_start, window_end)
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -733,36 +848,99 @@ class DailyCloseManager:
                 dedup_on_timestamp=True,
             )
 
-        written, failed = 0, 0
-        total_symbols = len(self.symbols)
-        checked = 0
+        # Round-based retry — same shape as BackfillManager.run(): each
+        # round makes one pass over whatever's still pending, pacing calls
+        # FETCH_PACING_SEC apart. A symbol that succeeds is done for good;
+        # one that fails goes into the next round's pending set, up to
+        # MAX_BACKFILL_ROUNDS total.
         try:
-            for symbol_row in self.symbols:
-                symbol   = str(symbol_row["symbol"]).upper()
-                exchange = str(symbol_row.get("exchange") or "NSE").upper()
-                row = self._fetch_daily_close_row(symbol, exchange)
-                if row is None:
-                    failed += 1
+            total_rows = 0
+            pending: Dict[str, str] = {
+                str(s["symbol"]).upper(): str(s.get("exchange") or "NSE").upper()
+                for s in self.symbols
+            }
+            last_failure_reason: Dict[str, str] = {}
+            round_num = 0
+
+            while pending and round_num < MAX_BACKFILL_ROUNDS:
+                round_num += 1
+                round_total = len(pending)
+                if round_num == 1:
+                    print(
+                        f"[DAILY_CLOSE] round {round_num}/{MAX_BACKFILL_ROUNDS} — "
+                        f"sweeping {round_total} symbol(s)",
+                        flush=True,
+                    )
                 else:
-                    if pg_writer is not None:
-                        pg_writer.enqueue(symbol, row)
-                    quote_writer.enqueue(symbol, row)
-                    written += 1
+                    print(
+                        f"[DAILY_CLOSE] round {round_num}/{MAX_BACKFILL_ROUNDS} — "
+                        f"retrying {round_total} symbol(s) that failed round "
+                        f"{round_num - 1}",
+                        flush=True,
+                    )
 
-                checked += 1
-                _progress_write(
-                    f"[DAILY_CLOSE] {checked}/{total_symbols} | {exchange}:{symbol} "
-                    f"| written={written} failed={failed}",
-                    index=checked,
-                    total=total_symbols,
-                )
+                still_pending: Dict[str, str] = {}
+                round_success = 0
+                checked = 0
 
-            _progress_done()
+                for symbol, exchange in pending.items():
+                    checked += 1
+                    row, failure_reason = self._fetch_daily_close_row(symbol, exchange)
+                    if row is not None:
+                        if pg_writer is not None:
+                            pg_writer.enqueue(symbol, row)
+                        quote_writer.enqueue(symbol, row)
+                        total_rows += 1
+                        last_failure_reason.pop(symbol, None)
+                        round_success += 1
+                    else:
+                        still_pending[symbol] = exchange
+                        last_failure_reason[symbol] = failure_reason or "0 rows returned"
+
+                    _progress_write(
+                        f"[DAILY_CLOSE] round {round_num}/{MAX_BACKFILL_ROUNDS} | "
+                        f"{checked}/{round_total} | {exchange}:{symbol} "
+                        f"| {total_rows} written so far",
+                        index=checked,
+                        total=round_total,
+                    )
+                    time.sleep(FETCH_PACING_SEC)
+
+                _progress_done()
+                pending = still_pending
+
+                if pending:
+                    print(
+                        f"[DAILY_CLOSE] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                        f"success={round_success} pending={len(pending)} "
+                        f"→ retrying pending in round {round_num + 1}"
+                        if round_num < MAX_BACKFILL_ROUNDS
+                        else f"[DAILY_CLOSE] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                             f"success={round_success} pending={len(pending)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[DAILY_CLOSE] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                        f"success={round_success} pending=0 → all recovered, stopping early",
+                        flush=True,
+                    )
+
             print(
-                f"[DAILY_CLOSE] wrote {written}/{len(self.symbols)} daily "
-                f"close(s){f', {failed} failed' if failed else ''}",
+                f"[DAILY_CLOSE] wrote {total_rows}/{len(self.symbols)} daily close(s)",
                 flush=True,
             )
+
+            if pending:
+                names = ", ".join(
+                    f"{exchange}:{symbol} ({last_failure_reason.get(symbol, 'unknown')})"
+                    for symbol, exchange in pending.items()
+                )
+                print(
+                    f"[DAILY_CLOSE][WARN] {len(pending)} symbol(s) still failing "
+                    f"after {round_num} round(s): {names}",
+                    flush=True,
+                )
         finally:
             # flush inside this thread — join() never reaches the event loop,
             # websocket/live writers are unaffected during this drain
@@ -828,43 +1006,124 @@ class DailyCloseManager:
         )
 
         total_symbols = len(self.symbols)
-        checked = 0
-        written, present, failed = 0, 0, 0
+        present = 0
 
+        # Which days each symbol is actually missing, computed once up
+        # front — the same "skip what's already there" step as before,
+        # just building the round loop's initial pending set instead of
+        # feeding straight into a single flat pass.
+        pending: Dict[str, Tuple[str, List[date]]] = {}
         try:
             for symbol_row in self.symbols:
                 symbol   = str(symbol_row["symbol"]).upper()
                 exchange = str(symbol_row.get("exchange") or "NSE").upper()
-
                 missing_days = _missing_daily_days(conn, symbol, required_days)
                 present += len(required_days) - len(missing_days)
+                if missing_days:
+                    pending[symbol] = (exchange, missing_days)
+        except Exception as exc:
+            print(f"[DAILY_CLOSE][BACKFILL][ERROR] {exc}", flush=True)
+            pg_writer.shutdown()
+            conn.close()
+            return
 
-                for day in missing_days:
-                    row = self._fetch_daily_close_row(
-                        symbol, exchange, day=day, source_tag="daily_close_backfill"
+        # Round-based retry — same shape as BackfillManager.run(). A
+        # symbol is retried as a whole (all its missing days together) if
+        # ANY of them failed that round — already-written days simply get
+        # queued again next round, harmless since PgWriter dedupes on
+        # timestamp, same rationale as the tick-level backfill.
+        try:
+            total_rows = 0
+            last_failure_reason: Dict[str, str] = {}
+            round_num = 0
+
+            while pending and round_num < MAX_BACKFILL_ROUNDS:
+                round_num += 1
+                round_total = len(pending)
+                if round_num == 1:
+                    print(
+                        f"[DAILY_CLOSE][BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} — "
+                        f"sweeping {round_total} symbol(s)",
+                        flush=True,
                     )
-                    if row is None:
-                        failed += 1
-                        continue
-                    pg_writer.enqueue(symbol, row)
-                    written += 1
+                else:
+                    print(
+                        f"[DAILY_CLOSE][BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} — "
+                        f"retrying {round_total} symbol(s) that failed round "
+                        f"{round_num - 1}",
+                        flush=True,
+                    )
 
-                checked += 1
-                _progress_write(
-                    f"[DAILY_CLOSE][BACKFILL] {checked}/{total_symbols} | "
-                    f"{exchange}:{symbol} | written={written} present={present} "
-                    f"failed={failed}",
-                    index=checked,
-                    total=total_symbols,
-                )
+                still_pending: Dict[str, Tuple[str, List[date]]] = {}
+                round_success = 0
+                checked = 0
 
-            _progress_done()
+                for symbol, (exchange, missing_days) in pending.items():
+                    checked += 1
+                    symbol_failed = False
+
+                    for day in missing_days:
+                        row, failure_reason = self._fetch_daily_close_row(
+                            symbol, exchange, day=day, source_tag="daily_close_backfill"
+                        )
+                        if row is not None:
+                            pg_writer.enqueue(symbol, row)
+                            total_rows += 1
+                        else:
+                            symbol_failed = True
+                            last_failure_reason[symbol] = failure_reason or "0 rows returned"
+                        time.sleep(FETCH_PACING_SEC)
+
+                    if symbol_failed:
+                        still_pending[symbol] = (exchange, missing_days)
+                    else:
+                        last_failure_reason.pop(symbol, None)
+                        round_success += 1
+
+                    _progress_write(
+                        f"[DAILY_CLOSE][BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} | "
+                        f"{checked}/{round_total} | {exchange}:{symbol} "
+                        f"| {total_rows} written so far",
+                        index=checked,
+                        total=round_total,
+                    )
+
+                _progress_done()
+                pending = still_pending
+
+                if pending:
+                    print(
+                        f"[DAILY_CLOSE][BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                        f"success={round_success} pending={len(pending)} "
+                        f"→ retrying pending in round {round_num + 1}"
+                        if round_num < MAX_BACKFILL_ROUNDS
+                        else f"[DAILY_CLOSE][BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                             f"success={round_success} pending={len(pending)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[DAILY_CLOSE][BACKFILL] round {round_num}/{MAX_BACKFILL_ROUNDS} done — "
+                        f"success={round_success} pending=0 → all recovered, stopping early",
+                        flush=True,
+                    )
+
             print(
-                f"[DAILY_CLOSE][BACKFILL] done — {written} written, {present} "
-                f"already present, {failed} failed "
-                f"({total_symbols} symbol(s) x {len(required_days)} day(s))",
+                f"[DAILY_CLOSE][BACKFILL] done — {total_rows} written, {present} "
+                f"already present ({total_symbols} symbol(s) x {len(required_days)} day(s))",
                 flush=True,
             )
+
+            if pending:
+                names = ", ".join(
+                    f"{exchange}:{symbol} ({last_failure_reason.get(symbol, 'unknown')})"
+                    for symbol, (exchange, _days) in pending.items()
+                )
+                print(
+                    f"[DAILY_CLOSE][BACKFILL][WARN] {len(pending)} symbol(s) still "
+                    f"failing after {round_num} round(s): {names}",
+                    flush=True,
+                )
         finally:
             pg_writer.shutdown()
             try:
@@ -878,7 +1137,18 @@ class DailyCloseManager:
         exchange: str,
         day: Optional[date] = None,
         source_tag: str = "daily_close",
-    ) -> Optional[dict]:
+    ) -> Tuple[Optional[dict], Optional[str]]:
+        """
+        Single attempt, no internal retry — retrying across attempts is now
+        the outer round-based loop's job (see backfill_missing_days /
+        _run_once), matching BackfillManager._fetch_symbol_window. Nothing
+        is printed here; printing per attempt is exactly the noise that
+        refactor removed for the tick-level backfill, and the same applies
+        here.
+
+        Returns (row, failure_reason). failure_reason is None only when
+        row is not None.
+        """
         day = day or now_kolkata().date()
         body = {
             "apikey":     self.api_key,
@@ -890,79 +1160,42 @@ class DailyCloseManager:
             "source":     "api",
         }
         data = json.dumps(body).encode("utf-8")
-        max_attempts = 3
 
-        for attempt in range(1, max_attempts + 1):
-            http_request = request.Request(
-                self.endpoint,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with request.urlopen(http_request, timeout=30) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-                if attempt < max_attempts:
-                    print(
-                        f"[DAILY_CLOSE][WARN] fetch failed for {exchange}:{symbol} "
-                        f"{day} (attempt {attempt}/{max_attempts}): {exc}; "
-                        f"retrying in 2s",
-                        flush=True,
-                    )
-                    time.sleep(2)
-                    continue
-                print(
-                    f"[DAILY_CLOSE][WARN] fetch failed for {exchange}:{symbol} "
-                    f"{day}: {exc}",
-                    flush=True,
-                )
-                return None
+        http_request = request.Request(
+            self.endpoint,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(http_request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return None, f"fetch error: {exc}"
 
-            rows = _extract_candle_rows(payload)
-            if not rows:
-                if attempt < max_attempts:
-                    print(
-                        f"[DAILY_CLOSE][WARN] no daily candle yet for "
-                        f"{exchange}:{symbol} {day} (attempt {attempt}/{max_attempts}); "
-                        f"retrying in 2s",
-                        flush=True,
-                    )
-                    time.sleep(2)
-                    continue
-                print(
-                    f"[DAILY_CLOSE][WARN] no daily candle returned for "
-                    f"{exchange}:{symbol} {day} after {max_attempts} attempts",
-                    flush=True,
-                )
-                return None
+        rows = _extract_candle_rows(payload)
+        if not rows:
+            return None, "0 rows returned"
 
-            # Single-day request → normally exactly one row; if the API
-            # ever returns more, the last one is the authoritative EOD row.
-            candle = rows[-1]
-            normalized = _normalize_candle(candle, symbol, exchange, "D")
-            if normalized is None:
-                print(
-                    f"[DAILY_CLOSE][WARN] daily candle for {exchange}:{symbol} "
-                    f"{day} had no readable timestamp — skipping",
-                    flush=True,
-                )
-                return None
+        # Single-day request → normally exactly one row; if the API
+        # ever returns more, the last one is the authoritative EOD row.
+        candle = rows[-1]
+        normalized = _normalize_candle(candle, symbol, exchange, "D")
+        if normalized is None:
+            return None, "no readable timestamp on returned candle"
 
-            # The broker's own daily-candle timestamp convention is
-            # ambiguous (could be session open, midnight, etc.) — pin it
-            # explicitly to market close so it always sorts after every
-            # real tick that day and is unambiguous to any reader.
-            close_dt = datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata)
-            close_ms = int(close_dt.astimezone(timezone.utc).timestamp() * 1000)
+        # The broker's own daily-candle timestamp convention is
+        # ambiguous (could be session open, midnight, etc.) — pin it
+        # explicitly to market close so it always sorts after every
+        # real tick that day and is unambiguous to any reader.
+        close_dt = datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata)
+        close_ms = int(close_dt.astimezone(timezone.utc).timestamp() * 1000)
 
-            payload_dict = json.loads(normalized["raw_json"])
-            payload_dict["timestamp"] = close_ms
-            payload_dict["source"] = source_tag
-            normalized["timestamp"] = close_dt.isoformat()
-            normalized["raw_json"] = json.dumps(
-                payload_dict, ensure_ascii=True, separators=(",", ":")
-            )
-            return normalized
-
-        return None
+        payload_dict = json.loads(normalized["raw_json"])
+        payload_dict["timestamp"] = close_ms
+        payload_dict["source"] = source_tag
+        normalized["timestamp"] = close_dt.isoformat()
+        normalized["raw_json"] = json.dumps(
+            payload_dict, ensure_ascii=True, separators=(",", ":")
+        )
+        return normalized, None

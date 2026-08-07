@@ -260,12 +260,17 @@ def _day_windows_from_log(
             if gap_start <= gap_end:
                 windows.append((gap_start, gap_end))
 
+    # Tracks the timestamp of the most recent DAY_STARTED/RECONNECTED seen
+    # so far, so an *unlogged* outage can be detected below.
+    last_connect_ms: Optional[int] = None
+
     for event, ts_ms, _mode in events:
         if event == "DISCONNECTED":
             if pending_disconnect_ms is None:
                 pending_disconnect_ms = ts_ms
         elif event in ("DAY_STARTED", "RECONNECTED"):
             if pending_disconnect_ms is not None:
+                # Normal case: a logged DISCONNECTED explains the gap.
                 gap_start = _floor_minute(_ms_to_ist(pending_disconnect_ms))
                 gap_end   = _floor_minute(_ms_to_ist(ts_ms))
                 gap_start = max(gap_start, session_start)
@@ -273,6 +278,22 @@ def _day_windows_from_log(
                 if gap_start <= gap_end:
                     windows.append((gap_start, gap_end))
                 pending_disconnect_ms = None
+            elif last_connect_ms is not None:
+                # A connect event follows an EARLIER connect event with no
+                # DISCONNECTED in between. That only happens when the
+                # process died without running any cleanup code - e.g. an
+                # SSH session drop sending SIGHUP to a foreground process,
+                # a SIGKILL, an OOM kill, or the host rebooting. There was
+                # no code alive to log DISCONNECTED at the moment it
+                # happened, but the outage is real: everything between the
+                # last known connect and this new one was missed.
+                gap_start = _floor_minute(_ms_to_ist(last_connect_ms))
+                gap_end   = _floor_minute(_ms_to_ist(ts_ms))
+                gap_start = max(gap_start, session_start)
+                gap_end   = min(gap_end, session_end)
+                if gap_start <= gap_end:
+                    windows.append((gap_start, gap_end))
+            last_connect_ms = ts_ms
 
     # trailing disconnect never followed by a reconnect in the log
     if pending_disconnect_ms is not None:
