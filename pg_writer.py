@@ -710,17 +710,22 @@ def _purge_db(dbname: str, table_patterns: List[str], cutoff_ms: int, label: str
             f"{tables_affected}/{len(tables)} table(s) (cutoff={cutoff_ms})"
         )
 
-        # VACUUM reclaims disk space after large deletes, but can't run
-        # inside a transaction block — needs its own autocommit connection.
+        # VACUUM FULL reclaims disk space after large deletes and returns it
+        # to the OS (plain VACUUM only marks space reusable by Postgres
+        # itself, it never shrinks the file) — can't run inside a
+        # transaction block, needs its own autocommit connection. It takes
+        # an ACCESS EXCLUSIVE lock and rewrites the whole table, so it's
+        # slower and briefly blocks reads/writes on that table; acceptable
+        # here since this only runs once per trading day, right after close.
         if total_deleted:
             conn.autocommit = True
             vac_cur = conn.cursor()
             for table in tables:
                 try:
-                    vac_cur.execute(f"VACUUM {table}")
+                    vac_cur.execute(f"VACUUM FULL {table}")
                 except Exception as exc:
-                    _safe_print(f"{tag}[WARN] vacuum failed for {table}: {exc}")
-            _safe_print(f"{tag} {label}: vacuum complete")
+                    _safe_print(f"{tag}[WARN] vacuum full failed for {table}: {exc}")
+            _safe_print(f"{tag} {label}: vacuum full complete")
 
     finally:
         try:
