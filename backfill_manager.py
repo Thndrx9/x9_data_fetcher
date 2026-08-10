@@ -23,6 +23,7 @@ from x9_data_fetcher.gap_detector import (
 )
 from x9_data_fetcher.market_time import (
     MARKET_CLOSE,
+    MARKET_OPEN,
     is_market_open,
     now_kolkata,
     tz_kolkata,
@@ -362,8 +363,26 @@ class BackfillManager:
             await asyncio.sleep(delay)
 
     def _run_once(self) -> None:
-        now           = now_kolkata()
-        required_days = _last_n_trading_days(now, self.min_days)
+        now = now_kolkata()
+
+        # _last_n_trading_days(now, n) is date-only — if today is a trading
+        # day it's included in the window the instant the calendar flips,
+        # even before the market has opened. _find_symbol_gaps then rightly
+        # skips scanning "today" until MARKET_OPEN (there's no session data
+        # yet), which quietly turns a "last N trading days" scan into only
+        # N-1 actually-scanned days. Roll the reference date back to the
+        # previous trading day in that case so we still scan N real,
+        # scannable trading days instead of silently scanning one fewer.
+        scan_reference_date = now.date()
+        if now.time() < MARKET_OPEN:
+            prev_day = _previous_trading_day(now.date())
+            if prev_day is not None:
+                scan_reference_date = prev_day
+
+        required_days = _last_n_trading_days(
+            datetime.combine(scan_reference_date, now.time(), tzinfo=now.tzinfo),
+            self.min_days,
+        )
 
         print(
             f"[BACKFILL] scanning last {self.min_days} trading days "
