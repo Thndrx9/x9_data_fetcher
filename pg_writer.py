@@ -78,6 +78,7 @@ import psycopg2.extras
 import psycopg2.extensions
 
 from x9_data_fetcher.market_time import MARKET_OPEN, is_trading_day, now_kolkata, tz_kolkata
+from x9_data_fetcher.console import colorize as _colorize
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -111,7 +112,7 @@ def _safe_print(text: str) -> None:
         if _progress_open:
             sys.stdout.write("\n")
             _progress_open = False
-        print(text, flush=True)
+        print(_colorize(text), flush=True)
 
 
 
@@ -497,6 +498,17 @@ def _load_existing_tables(
     # on the legacy JSONB schema untouched.
     if tables and prefix in ("quote", "depth"):
         try:
+            cur = conn.cursor()
+            # Reconciliation runs ADD COLUMN IF NOT EXISTS across every
+            # existing table in one transaction — with hundreds of tables
+            # that can legitimately take longer than the connection's
+            # default statement_timeout (10s, sized for a single live
+            # tick INSERT). SET LOCAL scopes the override to just this
+            # transaction; it's reverted automatically on the commit/
+            # rollback below, so the tight timeout is still in force for
+            # every live write that follows.
+            reconcile_timeout_sec = int(os.getenv("PG_RECONCILE_STATEMENT_TIMEOUT_SEC", "120"))
+            cur.execute(f"SET LOCAL statement_timeout = {reconcile_timeout_sec * 1000}")
             for table in tables:
                 _reconcile_columns(conn, table, prefix)
             conn.commit()
@@ -510,6 +522,86 @@ def _load_existing_tables(
     if tables:
         _safe_print(f"[PG_{prefix.upper()}] found {len(tables)} existing tables")
     return tables
+
+
+# ---------------------------------------------------------------------------
+# Orphan-table cleanup — quote_*/depth_* tables left behind by a symbol that
+# was later removed from symbols.csv. Nothing in the live write path ever
+# drops a table, so these just accumulate silently over time (e.g. a
+# 200-table DB against a 199-symbol universe). This is a manual, explicit
+# step — never called automatically from the live pipeline — so a symbol
+# that's only temporarily absent from symbols.csv can't have its history
+# dropped out from under it by accident.
+# ---------------------------------------------------------------------------
+
+def _valid_table_names(symbols_csv: str) -> Set[str]:
+    from x9_data_fetcher.symbols import load_symbols
+
+    names: Set[str] = set()
+    for row in load_symbols(symbols_csv):
+        safe = _safe_symbol(row["symbol"]).lower()
+        names.add(f"quote_{safe}")
+        names.add(f"depth_{safe}")
+    return names
+
+
+def find_orphan_tables(conn: psycopg2.extensions.connection, symbols_csv: str) -> List[str]:
+    """Return quote_*/depth_* tables in `conn`'s database that don't match
+    any symbol currently in symbols_csv."""
+    valid = _valid_table_names(symbols_csv)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT tablename FROM pg_tables "
+        "WHERE schemaname='public' AND (tablename LIKE 'quote_%' OR tablename LIKE 'depth_%') "
+        "ORDER BY tablename"
+    )
+    return [row[0] for row in cur.fetchall() if row[0] not in valid]
+
+
+def prune_orphan_tables(
+    symbols_csv: str = "symbols.csv",
+    dbname: Optional[str] = None,
+    dry_run: bool = True,
+) -> List[str]:
+    """
+    Find quote_*/depth_* tables with no matching symbol in symbols_csv and,
+    unless dry_run, drop them. Always returns the list of orphan table
+    names found (dropped or not).
+
+    Each DROP runs in its own transaction (autocommit), so a failure on one
+    table doesn't roll back tables already dropped or block the rest.
+    """
+    conn = psycopg2.connect(**_conn_params(dbname))
+    conn.autocommit = True
+    try:
+        orphans = find_orphan_tables(conn, symbols_csv)
+        if not orphans:
+            _safe_print("[PRUNE] no orphan tables found")
+            return orphans
+
+        for t in orphans:
+            _safe_print(f"[PRUNE] orphan: {t}")
+
+        if dry_run:
+            _safe_print(
+                f"[PRUNE] {len(orphans)} orphan table(s) found — dry run, nothing dropped "
+                f"(pass dry_run=False / --yes to drop)"
+            )
+            return orphans
+
+        dropped, failed = 0, 0
+        for t in orphans:
+            try:
+                conn.cursor().execute(f'DROP TABLE IF EXISTS "{t}"')
+                _safe_print(f"[PRUNE] dropped {t}")
+                dropped += 1
+            except Exception as exc:
+                _safe_print(f"[PRUNE][ERROR] failed to drop {t}: {exc}")
+                failed += 1
+        _safe_print(f"[PRUNE] done — dropped {dropped}, failed {failed}")
+        return orphans
+    finally:
+        conn.close()
 
 
 # Single source of truth for quote/depth schema: (column_name, sql_type).
@@ -1281,3 +1373,33 @@ class PgWriter:
                 return self._reconnect_after_failure(conn, buffered, pending_commit)
 
         return conn, known_tables
+
+
+# ---------------------------------------------------------------------------
+# CLI — currently just orphan-table pruning. The live pipeline never calls
+# this; it's a manual maintenance step:
+#     python3 -m x9_data_fetcher.pg_writer --prune-orphans           # dry run
+#     python3 -m x9_data_fetcher.pg_writer --prune-orphans --yes     # drop
+# ---------------------------------------------------------------------------
+
+def _main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="pg_writer maintenance CLI")
+    ap.add_argument("--prune-orphans", action="store_true",
+                     help="Find quote_*/depth_* tables with no matching symbol in symbols.csv")
+    ap.add_argument("--symbols", default="symbols.csv", help="Path to symbols.csv")
+    ap.add_argument("--dbname", default=None, help="Database to check (default: PG_DBNAME env / 'market')")
+    ap.add_argument("--yes", action="store_true", help="Actually drop orphan tables (default is dry run)")
+    args = ap.parse_args()
+
+    if args.prune_orphans:
+        prune_orphan_tables(symbols_csv=args.symbols, dbname=args.dbname, dry_run=not args.yes)
+        return 0
+
+    ap.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

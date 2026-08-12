@@ -1,0 +1,21 @@
+[project]
+name = "x9-data-fetcher"
+version = "0.1.0"
+description = "NSE tick/depth data fetcher, backfill manager, and Postgres/Parquet archiver"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv",
+    "pandas",
+    "pyarrow",
+    "websockets",
+    "psycopg2-binary",
+]
+
+# This folder (x9_data_fetcher) is a subpackage that's imported via sys.path
+# manipulation from a parent project (see start_data.py, which inserts its
+# own grandparent dir into sys.path so `import x9_data_fetcher.<module>`
+# resolves) — it's never pip-installed as a wheel itself. `package = false`
+# tells uv to only manage the dependency environment, not try to build this
+# directory as an installable package.
+[tool.uv]
+package = false
