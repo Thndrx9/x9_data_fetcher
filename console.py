@@ -10,6 +10,7 @@ Scheme:
     [ERROR]                        -> red
     [WARN]                         -> yellow
     [PRUNE]                        -> magenta   (destructive action, stand out)
+    [HEARTBEAT]                    -> blue
     "connected" / "complete" / "done" -> green
     anything else                  -> unchanged
 """
@@ -23,6 +24,7 @@ _RED = "\033[31m"
 _YELLOW = "\033[33m"
 _MAGENTA = "\033[35m"
 _GREEN = "\033[32m"
+_BLUE = "\033[34m"
 _RESET = "\033[0m"
 
 
@@ -35,6 +37,8 @@ def colorize(text: str) -> str:
         color = _YELLOW
     elif "[PRUNE]" in text:
         color = _MAGENTA
+    elif "[HEARTBEAT]" in text:
+        color = _BLUE
     elif "connected" in text or "complete" in text or "done" in text:
         color = _GREEN
     else:
