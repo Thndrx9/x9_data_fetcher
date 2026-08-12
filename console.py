@@ -12,12 +12,11 @@ as a whole (e.g. a line is "an error line" if it contains [ERROR]
 anywhere), but the color paint itself only lands on the [...] segments.
 
 Scheme:
-    [ERROR]                        -> red      (failure)
-    [WARN]                         -> yellow
-    [PRUNE]                        -> magenta   (destructive action, stand out)
-    [HEARTBEAT]                    -> blue
-    "connected" / "complete" / "done" -> green  (success)
-    anything else                  -> unchanged
+    [ERROR]     -> red      (failure)
+    [WARN]      -> yellow
+    [PRUNE]     -> magenta  (destructive action, stand out)
+    [HEARTBEAT] -> blue
+    everything else -> green (success/normal operation, by default)
 """
 
 import os
@@ -47,10 +46,13 @@ def colorize(text: str) -> str:
         color = _MAGENTA
     elif "[HEARTBEAT]" in text:
         color = _BLUE
-    elif "connected" in text or "complete" in text or "done" in text:
-        color = _GREEN
     else:
-        return text
+        # Not an error/warning/prune/heartbeat line — treat as normal,
+        # successful operation by default rather than requiring specific
+        # success keywords (which misses things like "Authenticated",
+        # "Subscribed", "connectable" that mean success but don't contain
+        # the literal words "connected"/"complete"/"done").
+        color = _GREEN
     # Color only the [TAG] segments; everything else in the line — the
     # message body — is left as plain text.
     return _TAG_RE.sub(lambda m: f"{color}{m.group(0)}{_RESET}", text)
