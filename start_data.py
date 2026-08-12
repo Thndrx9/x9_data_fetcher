@@ -14,10 +14,6 @@ from dotenv import load_dotenv
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from x9_data_fetcher.venv_setup import VENV_DIR, create_and_activate_venv
-
-create_and_activate_venv()
-
 from x9_data_fetcher.backfill_manager import (
     BackfillManager,
     DailyCloseManager,
@@ -39,6 +35,17 @@ from x9_data_fetcher.symbols import load_symbols
 from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup, purge_old_data
 from x9_data_fetcher import parquet_archiver
 from x9_data_fetcher.websocket_connect import websocket_client
+from x9_data_fetcher.console import colorize as _colorize
+
+_builtin_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001 — shadow builtin so every existing
+    # print() call in this file picks up the shared color scheme without
+    # having to edit each call site individually.
+    if args and isinstance(args[0], str):
+        args = (_colorize(args[0]),) + args[1:]
+    _builtin_print(*args, **kwargs)
 
 
 # Directory containing the x9_data_fetcher package — same one this file
@@ -48,28 +55,11 @@ from x9_data_fetcher.websocket_connect import websocket_client
 # launched from.
 _PACKAGE_PARENT_DIR = Path(__file__).resolve().parent.parent
 
-# Resolved eagerly, at import time — VENV_DIR is a relative path resolved
-# against whatever the process's cwd was when create_and_activate_venv()
-# ran above, which may differ from _PACKAGE_PARENT_DIR. Resolving the venv
-# directory itself now (before anything changes directories) pins it to
-# the right venv regardless of what cwd the archiver subprocess is later
-# launched with.
-#
-# IMPORTANT: only the venv directory portion is resolved — the trailing
-# bin/python is left as-is. venv's bin/python is a symlink to the base
-# system interpreter, and Python's venv detection at startup depends on
-# invoking it AS that symlink (it looks for a pyvenv.cfg next to
-# sys.executable's own path). Fully resolving through the symlink would
-# hand subprocess.Popen the bare system interpreter's real path instead —
-# which looks identical for stdlib-only scripts, but silently loses access
-# to every package actually installed in this venv (confirmed: psycopg2
-# imports fine via the symlink path, ModuleNotFoundError via the resolved
-# system path).
-_ARCHIVER_PYTHON = (
-    Path(VENV_DIR).resolve()
-    / ("Scripts" if os.name == "nt" else "bin")
-    / ("python.exe" if os.name == "nt" else "python")
-)
+# Interpreter used to launch the archiver subprocess. Under uv (`uv run
+# start_data.py`), sys.executable already points at the project's venv
+# interpreter for *this* process — that's exactly what a subprocess needs
+# too, so no separate venv bootstrap or lookup is required here.
+_ARCHIVER_PYTHON = Path(sys.executable)
 
 
 _LOCK_FILE_PATH = os.getenv("X9_FETCHER_LOCK_FILE", "/tmp/x9_data_fetcher.lock")

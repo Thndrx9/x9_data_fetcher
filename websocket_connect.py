@@ -11,6 +11,17 @@ from x9_data_fetcher.event_bus import (
     mark_ws_disconnected,
 )
 from x9_data_fetcher.market_time import now_kolkata
+from x9_data_fetcher.console import colorize as _colorize
+
+_builtin_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001 — shadow builtin so every existing
+    # print() call in this file picks up the shared color scheme without
+    # having to edit each call site individually.
+    if args and isinstance(args[0], str):
+        args = (_colorize(args[0]),) + args[1:]
+    _builtin_print(*args, **kwargs)
 
 DEFAULT_WS_URL = "ws://127.0.0.1:8765"
 

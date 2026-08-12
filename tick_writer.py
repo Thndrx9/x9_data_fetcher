@@ -11,6 +11,18 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 from zoneinfo import ZoneInfo
 
+from x9_data_fetcher.console import colorize as _colorize
+
+_builtin_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001 — shadow builtin so every existing
+    # print() call in this file picks up the shared color scheme without
+    # having to edit each call site individually.
+    if args and isinstance(args[0], str):
+        args = (_colorize(args[0]),) + args[1:]
+    _builtin_print(*args, **kwargs)
+
 
 IST = ZoneInfo("Asia/Kolkata")
 
