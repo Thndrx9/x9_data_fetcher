@@ -6,16 +6,22 @@ already present in the message text — nothing needs to pass an explicit
 color. Auto-disables when stdout isn't a real terminal (piped to a file,
 CI, etc.) or when NO_COLOR is set, so redirected/logged output stays plain.
 
+Only the bracketed [TAG] portions of a line are colored — the message body
+after them stays plain. Which color applies is still decided by the line
+as a whole (e.g. a line is "an error line" if it contains [ERROR]
+anywhere), but the color paint itself only lands on the [...] segments.
+
 Scheme:
-    [ERROR]                        -> red
+    [ERROR]                        -> red      (failure)
     [WARN]                         -> yellow
     [PRUNE]                        -> magenta   (destructive action, stand out)
     [HEARTBEAT]                    -> blue
-    "connected" / "complete" / "done" -> green
+    "connected" / "complete" / "done" -> green  (success)
     anything else                  -> unchanged
 """
 
 import os
+import re
 import sys
 
 COLOR_ENABLED = sys.stdout.isatty() and not os.getenv("NO_COLOR")
@@ -26,6 +32,8 @@ _MAGENTA = "\033[35m"
 _GREEN = "\033[32m"
 _BLUE = "\033[34m"
 _RESET = "\033[0m"
+
+_TAG_RE = re.compile(r"\[[^\[\]]*\]")
 
 
 def colorize(text: str) -> str:
@@ -43,4 +51,6 @@ def colorize(text: str) -> str:
         color = _GREEN
     else:
         return text
-    return f"{color}{text}{_RESET}"
+    # Color only the [TAG] segments; everything else in the line — the
+    # message body — is left as plain text.
+    return _TAG_RE.sub(lambda m: f"{color}{m.group(0)}{_RESET}", text)
