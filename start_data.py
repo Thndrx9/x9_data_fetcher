@@ -33,6 +33,7 @@ from x9_data_fetcher.market_time import (
 )
 from x9_data_fetcher.symbols import load_symbols
 from x9_data_fetcher.pg_writer import auto_setup as pg_auto_setup, purge_old_data
+from x9_data_fetcher.candle_archiver import archive_aging_out_days, run_startup_catch_up, purge_old_candles
 from x9_data_fetcher import parquet_archiver
 from x9_data_fetcher.websocket_connect import websocket_client
 from x9_data_fetcher.console import colorize as _colorize
@@ -245,6 +246,30 @@ async def run_engine():
         or os.getenv("PG_HDBNAME", "").strip()
         or pg_dsn
     )
+
+    # ── Startup candle-archive check — the daily-close loop further below
+    #    only runs the candle archiver once per day at market close, so if
+    #    this process was down across one or more of those closes, the
+    #    affected day(s) would go straight to purge_old_data() with no
+    #    candle archive ever built for them. Checking again here at startup
+    #    closes that gap. Idempotent — an already-up-to-date archive costs
+    #    one cheap lookup per symbol/day and returns almost instantly, so
+    #    this is safe to run on every normal restart, not just after
+    #    downtime. Independent of the broker history API used by backfill
+    #    below (pure local Postgres read/write), so no need to sequence it
+    #    before or after those tasks — fire-and-forget, same as them. ──
+    candle_archive_startup_task = None
+    if pg_configured:
+        async def _run_startup_candle_archive_check():
+            try:
+                await asyncio.to_thread(run_startup_catch_up)
+            except Exception as exc:
+                print(f"[CANDLE_ARCHIVER][ERROR] startup check failed: {exc}", flush=True)
+
+        candle_archive_startup_task = asyncio.create_task(
+            _run_startup_candle_archive_check()
+        )
+        print("[X9_FETCHER] Startup candle-archive check launched", flush=True)
 
     # ── Startup backfill — fires immediately at script launch, independent of
     #    session schedule.  Recovers past days without waiting for 09:14. ──
@@ -467,6 +492,10 @@ async def run_engine():
                 print(f"[ARCHIVER][ERROR] end-of-day archive/merge failed: {exc}", flush=True)
 
         if manual_stop.is_set():
+            # Cancel startup candle-archive check if still running
+            if candle_archive_startup_task and not candle_archive_startup_task.done():
+                candle_archive_startup_task.cancel()
+                await asyncio.gather(candle_archive_startup_task, return_exceptions=True)
             # Cancel startup backfill tasks if still running
             if startup_backfill_task and not startup_backfill_task.done():
                 startup_backfill_task.cancel()
@@ -486,11 +515,30 @@ async def run_engine():
         # ── Daily retention purge — runs once per trading day at market
         #    close. Blocking psycopg2 calls, so offload to a thread rather
         #    than stalling the event loop / next session's pre-connect wait.
+        #    Candle archival runs FIRST, always — it builds and stores
+        #    1-minute candles (candle1m_<symbol>) for any day about to
+        #    fall out of purge_old_data()'s raw-tick retention window, so
+        #    that day's OHLCV survives in compact form even after its raw
+        #    ticks are deleted below. Idempotent — a day already archived
+        #    on a previous run costs one cheap indexed lookup, not a
+        #    repeat of the full build. See candle_archiver.py's docstring.
+        #    purge_old_candles() then trims candle1m_<symbol> itself down
+        #    to the same 3-trading-day window as raw ticks — kept as its
+        #    own call (not folded into purge_old_data) since this module
+        #    owns that table's schema and column naming.
         if pg_configured:
+            try:
+                await asyncio.to_thread(archive_aging_out_days)
+            except Exception as exc:
+                print(f"[CANDLE_ARCHIVER][ERROR] archive failed: {exc}", flush=True)
             try:
                 await asyncio.to_thread(purge_old_data)
             except Exception as exc:
                 print(f"[RETENTION][ERROR] purge failed: {exc}", flush=True)
+            try:
+                await asyncio.to_thread(purge_old_candles)
+            except Exception as exc:
+                print(f"[CANDLE_ARCHIVER][ERROR] candle purge failed: {exc}", flush=True)
         # Loop back → will calculate wait until next 9:14 (skipping weekends)
 
 
