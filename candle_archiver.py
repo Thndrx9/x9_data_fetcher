@@ -57,12 +57,21 @@ import psycopg2.extras
 from x9_data_fetcher.market_time import now_kolkata, tz_kolkata
 from x9_data_fetcher.pg_writer import (
     _conn_params,
-    _configured_dbnames,
     _safe_print,
     _cutoff_ms,
     LIVE_TICK_RETENTION_TRADING_DAYS,
     _last_n_trading_days,
 )
+
+# This module only ever touches the PRIMARY database — the one holding raw
+# live ticks (quote_<symbol>/depth_<symbol>). It never touches the separate
+# history database (PG_HDBNAME) even though pg_writer.py's other functions
+# (purge_old_data, table setup, etc.) loop over both — that history db holds
+# PRE-BUILT candles straight from the broker API, not raw ticks, so there's
+# nothing here for this module to read or archive there, and touching it
+# needlessly caused lock contention with whatever else uses that database.
+def _primary_dbname() -> str:
+    return os.getenv("PG_DBNAME", "market").strip() or "market"
 
 # Raw ticks for today and this many trading days back stay tick-level —
 # only days OLDER than this get archived to candle1m_<symbol> and are
@@ -312,11 +321,14 @@ def archive_aging_out_days(
     now=None,
 ) -> int:
     """
-    For every configured database, build and store 1-minute candles
-    (candle1m_<symbol>) for every trading day that's older than
+    Build and store 1-minute candles (candle1m_<symbol>) in the PRIMARY
+    database only, for every trading day that's older than
     `keep_recent_trading_days` but still has raw ticks present — i.e.
     every day about to (or already eligible to) fall out of
-    purge_old_data()'s raw-tick retention window.
+    purge_old_data()'s raw-tick retention window. Deliberately does NOT
+    touch the separate history database (PG_HDBNAME) — that one holds
+    pre-built candles from the broker API already, not raw ticks, so
+    there's nothing there for this to read.
 
     Call this BEFORE purge_old_data() in the daily loop so a day's
     candle archive always exists before its raw ticks are deleted.
@@ -328,10 +340,10 @@ def archive_aging_out_days(
     almost instantly; only a real backlog (e.g. this process having
     missed one or more market closes while down) costs real work.
 
-    Returns the total number of candle rows written across every
-    database — 0 means everything was already up to date, nothing to
-    do. This is a plain read of what was written, not a fresh lookup,
-    so it costs nothing extra beyond the archive pass itself.
+    Returns the total number of candle rows written — 0 means
+    everything was already up to date, nothing to do. This is a plain
+    read of what was written, not a fresh lookup, so it costs nothing
+    extra beyond the archive pass itself.
 
     Safe to call even if PostgreSQL isn't configured/reachable — logs
     and returns 0 rather than raising.
@@ -342,9 +354,7 @@ def archive_aging_out_days(
         f"[CANDLE_ARCHIVER] starting — archiving days older than "
         f"{keep_recent_trading_days} trading day(s) back"
     )
-    total_written = 0
-    for dbname in _configured_dbnames():
-        total_written += _archive_db(dbname, keep_recent_trading_days, now)
+    total_written = _archive_db(_primary_dbname(), keep_recent_trading_days, now)
     _safe_print(f"[CANDLE_ARCHIVER] done in {time.monotonic() - start:.1f}s")
     return total_written
 
@@ -465,10 +475,13 @@ def purge_old_candles(
 ) -> None:
     """
     Delete candle1m_<symbol> rows older than `keep_trading_days` trading
-    days — same cutoff window as pg_writer.purge_old_data() uses for raw
-    tick data (quote_*/depth_*), computed the exact same way via
-    pg_writer._cutoff_ms(), so both purges agree on what "3 trading days"
-    means down to the millisecond.
+    days, in the PRIMARY database only (never the history database —
+    same reasoning as archive_aging_out_days() above: candle1m_<symbol>
+    only ever exists in the primary db in the first place, since that's
+    the only db this module ever writes to). Same cutoff window as
+    pg_writer.purge_old_data() uses for raw tick data (quote_*/depth_*),
+    computed the exact same way via pg_writer._cutoff_ms(), so both
+    purges agree on what "3 trading days" means down to the millisecond.
 
     Call this at market close, alongside (order doesn't matter relative
     to) purge_old_data() — this only ever touches candle1m_* tables, so
@@ -485,8 +498,7 @@ def purge_old_candles(
         f"[CANDLE_ARCHIVER] starting 1m-candle purge — keep last "
         f"{keep_trading_days} trading day(s) (cutoff={cutoff_ms})"
     )
-    for dbname in _configured_dbnames():
-        _purge_candles_db(dbname, cutoff_ms)
+    _purge_candles_db(_primary_dbname(), cutoff_ms)
     _safe_print(f"[CANDLE_ARCHIVER] 1m-candle purge done in {time.monotonic() - start:.1f}s")
 
 
