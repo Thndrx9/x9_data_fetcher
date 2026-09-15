@@ -164,6 +164,20 @@ _BUILD_1M_CANDLES_SQL = """
         SUM(tick_volume)                             AS volume
     FROM d
     GROUP BY bucket_ms
+    -- Only enforce the "must have real volume" check for buckets at or
+    -- after 15:15 IST — that's specifically where NSE's Closing Auction
+    -- Session (for F&O-enabled stocks) can leave the feed pushing
+    -- stale/repeated quote packets with no real trade behind them,
+    -- producing a degenerate candle (open=high=low=close, volume=0).
+    -- Non-F&O stocks keep trading normally past 15:15 right up to
+    -- market close, so their real ticks in that window must NOT be
+    -- dropped — this only filters a 15:15+ bucket when it truly has
+    -- zero volume; every bucket before 15:15 is kept unconditionally,
+    -- same as always. 54900000 ms = 15:15 IST-since-midnight, checked
+    -- against bucket_ms (each bucket's own minute-start), not the raw
+    -- tick timestamp.
+    HAVING MOD(bucket_ms + 19800000, 86400000) < 54900000
+        OR SUM(tick_volume) > 0
     ORDER BY bucket_ms
 """
 

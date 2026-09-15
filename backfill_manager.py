@@ -70,7 +70,7 @@ MAX_BACKFILL_ROUNDS = 9
 # mostly-unwanted date range into a single request just to patch one
 # unrelated window.
 WINDOW_MERGE_MAX_SPAN_DAYS = 5
-FETCH_PACING_SEC = 0.5
+FETCH_PACING_SEC = 0.9
 
 
 def _group_windows_for_merge(gaps: List[HistoryWindow]) -> List[List[HistoryWindow]]:
