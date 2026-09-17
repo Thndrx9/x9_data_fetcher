@@ -30,7 +30,7 @@ before the existing purge_old_data() call:
 
     from x9_data_fetcher.candle_archiver import archive_aging_out_days
     ...
-    await asyncio.to_thread(archive_aging_out_days)
+    await asyncio.to_thread(archive_aging_out_days, api_key)
     await asyncio.to_thread(purge_old_data)
 
 Safe to call even if PostgreSQL isn't configured/reachable — logs and
@@ -62,6 +62,7 @@ from x9_data_fetcher.pg_writer import (
     LIVE_TICK_RETENTION_TRADING_DAYS,
     _last_n_trading_days,
 )
+from x9_data_fetcher.fo_symbols import get_fo_underlyings
 
 # This module only ever touches the PRIMARY database — the one holding raw
 # live ticks (quote_<symbol>/depth_<symbol>). It never touches the separate
@@ -117,6 +118,15 @@ def _ensure_candle1m_table(conn, symbol: str) -> str:
 # x9 client (backfill_manager.py's _fetch_1m_candles_from_main_db) —
 # IST minute-bucket boundary via UTC-ms arithmetic, no per-row Python
 # datetime conversion needed since this all happens server-side in SQL.
+#
+# {fo_cutoff_clause} is filled in by _build_1m_candles_for_day: for an
+# F&O-eligible symbol (goes through NSE's Closing Auction Session), it's
+# a hard "< 15:15" upper bound — continuous trading genuinely ends there
+# for these symbols, so anything after simply never enters candle-
+# building at all, rather than trying to detect the CAS artifacts
+# after the fact. For a non-F&O symbol it's empty — real continuous
+# trading keeps going normally to market close, unchanged from how
+# this always worked.
 _BUILD_1M_CANDLES_SQL = """
     WITH b AS (
         SELECT
@@ -133,6 +143,7 @@ _BUILD_1M_CANDLES_SQL = """
         WHERE timestamp >= %s AND timestamp < %s
           AND ltp IS NOT NULL
           AND MOD(timestamp + 19800000, 86400000) >= 33300000
+          {fo_cutoff_clause}
     ),
     d AS (
         -- "volume" is the feed's CUMULATIVE volume-traded-today
@@ -146,14 +157,43 @@ _BUILD_1M_CANDLES_SQL = """
         -- row in this window — the counter starts at 0 at day open,
         -- so that tick's own cumulative value already IS its full
         -- incremental contribution (LAG → NULL → COALESCE to 0
-        -- baseline). GREATEST guards against any out-of-order tick
+        -- baseline).
+        --
+        -- GENERAL GAP GUARD: if a tick arrives more than 90s after the
+        -- previous one — a genuine websocket outage, mid-day or
+        -- otherwise — its cumulative-volume jump reflects EVERYTHING
+        -- that happened during that whole silent stretch, not just its
+        -- own single minute. Attributing all of it to the one bucket
+        -- that tick happens to land in would produce a misleading
+        -- volume spike. So that tick's contribution is zeroed instead
+        -- of diffed — its price (ltp) is still used for
+        -- high/low/open/close as normal, only its volume is treated as
+        -- unreliable and dropped. This is independent of the F&O
+        -- cutoff above — it applies to any symbol, any time of day,
+        -- for genuine outages the fo_cutoff_clause doesn't already
+        -- exclude outright.
+        --
+        -- GREATEST also still guards against any out-of-order tick
         -- producing a spurious negative diff.
         SELECT
             timestamp,
             ltp,
             bucket_ms,
-            GREATEST(cum_volume - COALESCE(LAG(cum_volume) OVER (ORDER BY timestamp ASC), 0), 0) AS tick_volume
-        FROM b
+            CASE
+                WHEN prev_timestamp IS NULL THEN cum_volume
+                WHEN (timestamp - prev_timestamp) > 90000 THEN 0
+                ELSE GREATEST(cum_volume - prev_cum_volume, 0)
+            END AS tick_volume
+        FROM (
+            SELECT
+                timestamp,
+                ltp,
+                bucket_ms,
+                cum_volume,
+                LAG(timestamp)   OVER (ORDER BY timestamp ASC) AS prev_timestamp,
+                LAG(cum_volume)  OVER (ORDER BY timestamp ASC) AS prev_cum_volume
+            FROM b
+        ) g
     )
     SELECT
         bucket_ms,
@@ -164,35 +204,38 @@ _BUILD_1M_CANDLES_SQL = """
         SUM(tick_volume)                             AS volume
     FROM d
     GROUP BY bucket_ms
-    -- Only enforce the "must have real volume" check for buckets at or
-    -- after 15:15 IST — that's specifically where NSE's Closing Auction
-    -- Session (for F&O-enabled stocks) can leave the feed pushing
-    -- stale/repeated quote packets with no real trade behind them,
-    -- producing a degenerate candle (open=high=low=close, volume=0).
-    -- Non-F&O stocks keep trading normally past 15:15 right up to
-    -- market close, so their real ticks in that window must NOT be
-    -- dropped — this only filters a 15:15+ bucket when it truly has
-    -- zero volume; every bucket before 15:15 is kept unconditionally,
-    -- same as always. 54900000 ms = 15:15 IST-since-midnight, checked
-    -- against bucket_ms (each bucket's own minute-start), not the raw
-    -- tick timestamp.
-    HAVING MOD(bucket_ms + 19800000, 86400000) < 54900000
-        OR SUM(tick_volume) > 0
     ORDER BY bucket_ms
 """
 
+# 54900000 ms = 15:15 IST-since-midnight (matches the ms-arithmetic used
+# throughout this file, e.g. 33300000 = 09:15).
+_FO_CUTOFF_MS = 54900000
 
-def _build_1m_candles_for_day(conn, quote_table: str, day_start_ms: int, day_end_ms: int) -> list:
+
+def _build_1m_candles_for_day(conn, quote_table: str, day_start_ms: int, day_end_ms: int, is_fo: bool) -> list:
     """
     Build 1-minute OHLCV candles for one symbol/day from its raw
     quote_<symbol> ticks, using the subtraction (diffed cumulative
     volume) method — see _BUILD_1M_CANDLES_SQL's inline comment.
+
+    is_fo: whether this symbol has active F&O contracts (goes through
+    NSE's Closing Auction Session). When True, ticks at/after 15:15 IST
+    are excluded outright — continuous trading genuinely ends there for
+    these symbols, so there's nothing genuine to build a candle from
+    past that point. When False, no time restriction is added beyond
+    the normal 09:15 session start — trading continues normally to
+    market close, unchanged from how this always worked.
+
     Returns a list of (ts_ms, open, high, low, close, volume) tuples,
     empty if the table doesn't exist or has no ticks in this window.
     """
+    fo_cutoff_clause = (
+        f"AND MOD(timestamp + 19800000, 86400000) < {_FO_CUTOFF_MS}" if is_fo else ""
+    )
+    sql = _BUILD_1M_CANDLES_SQL.format(table=_quote_ident(quote_table), fo_cutoff_clause=fo_cutoff_clause)
     cur = conn.cursor()
     try:
-        cur.execute(_BUILD_1M_CANDLES_SQL.format(table=_quote_ident(quote_table)), (day_start_ms, day_end_ms))
+        cur.execute(sql, (day_start_ms, day_end_ms))
         return cur.fetchall()
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
@@ -211,7 +254,7 @@ def _quote_symbol_from_table(table: str) -> Optional[str]:
     return table[len("quote_"):]
 
 
-def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime) -> int:
+def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime, api_key: str) -> int:
     """
     Returns the number of candle rows written for this database (0 if
     everything was already archived, i.e. this db was already up to date).
@@ -222,6 +265,11 @@ def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime) -> in
     except Exception as exc:
         _safe_print(f"{tag}[ERROR] connect failed: {exc}")
         return 0
+
+    # Fetched once per db pass (not per symbol) — get_fo_underlyings()
+    # itself only hits OpenAlgo when its cache is stale (see
+    # fo_symbols.py), so this is cheap even called this often.
+    fo_underlyings = get_fo_underlyings(api_key)
 
     try:
         conn.autocommit = False
@@ -264,6 +312,7 @@ def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime) -> in
             symbol = _quote_symbol_from_table(table)
             if not symbol:
                 continue
+            is_fo = symbol.upper() in fo_underlyings
 
             candle_table = f"candle1m_{symbol}".lower()
             table_exists = candle_table in existing_candle_tables
@@ -285,7 +334,7 @@ def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime) -> in
                     if cur.fetchone():
                         continue
 
-                rows = _build_1m_candles_for_day(conn, table, day_start_ms, day_end_ms)
+                rows = _build_1m_candles_for_day(conn, table, day_start_ms, day_end_ms, is_fo)
                 if not rows:
                     continue
 
@@ -331,6 +380,7 @@ def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime) -> in
 
 
 def archive_aging_out_days(
+    api_key: str,
     keep_recent_trading_days: int = KEEP_RAW_TICK_TRADING_DAYS,
     now=None,
 ) -> int:
@@ -343,6 +393,13 @@ def archive_aging_out_days(
     touch the separate history database (PG_HDBNAME) — that one holds
     pre-built candles from the broker API already, not raw ticks, so
     there's nothing there for this to read.
+
+    api_key: OpenAlgo API key — used to fetch (or read from cache) the
+    current F&O-eligible symbol list, so a symbol that goes through
+    NSE's Closing Auction Session gets its candles cut off at 15:15
+    instead of continuing to market close. See fo_symbols.py — the
+    actual network fetch only happens roughly once a day, not on every
+    call, so passing this through here is cheap.
 
     Call this BEFORE purge_old_data() in the daily loop so a day's
     candle archive always exists before its raw ticks are deleted.
@@ -368,12 +425,13 @@ def archive_aging_out_days(
         f"[CANDLE_ARCHIVER] starting — archiving days older than "
         f"{keep_recent_trading_days} trading day(s) back"
     )
-    total_written = _archive_db(_primary_dbname(), keep_recent_trading_days, now)
+    total_written = _archive_db(_primary_dbname(), keep_recent_trading_days, now, api_key)
     _safe_print(f"[CANDLE_ARCHIVER] done in {time.monotonic() - start:.1f}s")
     return total_written
 
 
 def run_startup_catch_up(
+    api_key: str,
     keep_recent_trading_days: int = KEEP_RAW_TICK_TRADING_DAYS,
     now=None,
 ) -> int:
@@ -393,7 +451,7 @@ def run_startup_catch_up(
         - returns 0  → archive was already up to date, nothing done
         - returns >0 → was behind, caught up now, returns row count
     """
-    written = archive_aging_out_days(keep_recent_trading_days, now)
+    written = archive_aging_out_days(api_key, keep_recent_trading_days, now)
     if written:
         _safe_print(
             f"[CANDLE_ARCHIVER] startup check: was behind — archived "
@@ -532,10 +590,15 @@ def _main() -> int:
                      help=f"Trading days to leave as raw ticks (default {KEEP_RAW_TICK_TRADING_DAYS})")
     ap.add_argument("--keep-trading-days", type=int, default=LIVE_TICK_RETENTION_TRADING_DAYS,
                      help=f"Trading days of candle1m_* data to keep before purge (default {LIVE_TICK_RETENTION_TRADING_DAYS})")
+    ap.add_argument("--api-key", type=str, default=os.getenv("API_KEY", ""),
+                     help="OpenAlgo API key, for the F&O-eligible symbol lookup (defaults to the API_KEY env var)")
     args = ap.parse_args()
 
     if args.run:
-        archive_aging_out_days(keep_recent_trading_days=args.keep_recent_days)
+        if not args.api_key:
+            print("[CANDLE_ARCHIVER][ERROR] no API key — pass --api-key or set API_KEY", flush=True)
+            return 1
+        archive_aging_out_days(args.api_key, keep_recent_trading_days=args.keep_recent_days)
         return 0
     if args.purge:
         purge_old_candles(keep_trading_days=args.keep_trading_days)
