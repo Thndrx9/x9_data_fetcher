@@ -25,6 +25,12 @@ FO_LIST_MAX_AGE_HOURS (default 24h — i.e. refreshed at most once a
 day), matching how often OpenAlgo's own master contracts typically
 refresh.
 
+Every time a fresh fetch happens, this also writes cas_symbols.csv —
+one row per symbol in symbols.csv, flagged True/False for whether it
+goes through NSE's Closing Auction Session (15:15 close) or trades
+normally to 15:30. Same daily cadence as the underlying list itself,
+no separate script or schedule needed to keep it current.
+
 Usage:
     from x9_data_fetcher.fo_symbols import get_fo_underlyings
     fo_set = get_fo_underlyings(api_key)
@@ -37,6 +43,7 @@ stale, or an empty set if there's no cache at all yet. Never raises.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import time
@@ -45,9 +52,12 @@ from typing import Optional, Set
 from urllib import request
 from urllib.error import URLError
 
+from x9_data_fetcher.symbols import load_symbols
+
 FO_LIST_MAX_AGE_HOURS = float(os.getenv("FO_LIST_MAX_AGE_HOURS", "24").strip() or "24")
 
 _CACHE_FILENAME = "fo_symbols_cache.json"
+_CAS_CSV_FILENAME = "cas_symbols.csv"
 
 
 def _cache_path() -> Path:
@@ -57,6 +67,13 @@ def _cache_path() -> Path:
     which directory the process was launched from.
     """
     return Path(__file__).resolve().parent / _CACHE_FILENAME
+
+
+def _cas_csv_path() -> Path:
+    override = os.getenv("CAS_SYMBOLS_CSV_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / _CAS_CSV_FILENAME
 
 
 def _instruments_endpoint() -> str:
@@ -123,6 +140,59 @@ def _save_cache(underlyings: Set[str]) -> None:
         print(f"[FO_SYMBOLS][ERROR] cache write failed: {exc}", flush=True)
 
 
+def _write_cas_symbols_csv(underlyings: Set[str]) -> None:
+    """
+    Cross-references the fresh F&O set against symbols.csv and writes
+    cas_symbols.csv — one row per symbol you actually track, flagged
+    True/False for whether it goes through NSE's Closing Auction
+    Session (ends continuous trading at 15:15) or trades normally to
+    15:30. Called automatically after every successful fresh fetch in
+    get_fo_underlyings() below, so this file stays in sync with the
+    same once-a-day refresh cadence — no separate script or schedule
+    needed.
+
+    Best-effort only: symbols.csv might not be found (e.g. running from
+    an unexpected working directory), and that's fine — this file is a
+    convenience report, not something anything else in this app reads
+    from, so a failure here is logged and swallowed rather than
+    affecting the F&O lookup itself.
+    """
+    try:
+        symbols = load_symbols("symbols.csv")
+    except FileNotFoundError as exc:
+        print(f"[FO_SYMBOLS][WARN] cas_symbols.csv not written — {exc}", flush=True)
+        return
+
+    rows = []
+    cas_count = 0
+    for entry in symbols:
+        symbol = entry["symbol"].upper()
+        goes_through_cas = symbol in underlyings
+        if goes_through_cas:
+            cas_count += 1
+        rows.append({
+            "exchange": entry["exchange"],
+            "symbol": symbol,
+            "goes_through_cas": goes_through_cas,
+        })
+
+    path = _cas_csv_path()
+    try:
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["exchange", "symbol", "goes_through_cas"])
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as exc:
+        print(f"[FO_SYMBOLS][ERROR] cas_symbols.csv write failed: {exc}", flush=True)
+        return
+
+    print(
+        f"[FO_SYMBOLS] cas_symbols.csv refreshed — {len(rows)} symbol(s), "
+        f"{cas_count} go through CAS (end at 15:15)",
+        flush=True,
+    )
+
+
 def get_fo_underlyings(api_key: str, max_age_hours: float = FO_LIST_MAX_AGE_HOURS) -> Set[str]:
     """
     Returns the current set of F&O-eligible underlying symbols
@@ -152,6 +222,7 @@ def get_fo_underlyings(api_key: str, max_age_hours: float = FO_LIST_MAX_AGE_HOUR
     fresh = _fetch_nfo_underlyings(api_key)
     if fresh is not None:
         _save_cache(fresh)
+        _write_cas_symbols_csv(fresh)
         print(f"[FO_SYMBOLS] refreshed — {len(fresh)} F&O-eligible underlying(s)", flush=True)
         return fresh
 
