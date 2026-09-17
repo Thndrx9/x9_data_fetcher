@@ -262,7 +262,7 @@ async def run_engine():
     if pg_configured:
         async def _run_startup_candle_archive_check():
             try:
-                await asyncio.to_thread(run_startup_catch_up)
+                await asyncio.to_thread(run_startup_catch_up, api_key)
             except Exception as exc:
                 print(f"[CANDLE_ARCHIVER][ERROR] startup check failed: {exc}", flush=True)
 
@@ -528,7 +528,7 @@ async def run_engine():
         #    owns that table's schema and column naming.
         if pg_configured:
             try:
-                await asyncio.to_thread(archive_aging_out_days)
+                await asyncio.to_thread(archive_aging_out_days, api_key)
             except Exception as exc:
                 print(f"[CANDLE_ARCHIVER][ERROR] archive failed: {exc}", flush=True)
             try:
