@@ -31,8 +31,8 @@ JSONB blob. 'daily' candle-history tables are unchanged/legacy JSONB.)
         sell0_price, sell0_qty, sell0_orders, ... sell4_*
 
     quote_RELIANCE, quote_TCS, quote_WIPRO ...
-        timestamp, ingest_ns, ltp, ltt, volume, open, high, low, close,
-        last_quantity, oi, upper_circuit, lower_circuit
+        timestamp, ingest_ns, ltp, ltt, volume,
+        oi, upper_circuit, lower_circuit
 
     (symbol/exchange/mode are NOT stored as columns — 100% redundant
     with the table name itself, since each table only ever holds one
@@ -619,11 +619,6 @@ _QUOTE_COLUMN_DEFS = (
     ("ltp", "DOUBLE PRECISION"),
     ("ltt", "BIGINT"),
     ("volume", "BIGINT"),
-    ("open", "DOUBLE PRECISION"),
-    ("high", "DOUBLE PRECISION"),
-    ("low", "DOUBLE PRECISION"),
-    ("close", "DOUBLE PRECISION"),
-    ("last_quantity", "BIGINT"),
     ("oi", "BIGINT"),
     ("upper_circuit", "DOUBLE PRECISION"),
     ("lower_circuit", "DOUBLE PRECISION"),
@@ -977,8 +972,7 @@ def _parse(row: dict, prefix: str) -> tuple:
         return (
             ts_ms, ingest_ns,
             d.get("ltp"), d.get("ltt"), d.get("volume"),
-            d.get("open"), d.get("high"), d.get("low"), d.get("close"),
-            d.get("last_quantity"), d.get("oi"),
+            d.get("oi"),
             d.get("upper_circuit"), d.get("lower_circuit"),
         )
 
