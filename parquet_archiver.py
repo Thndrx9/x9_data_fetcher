@@ -27,6 +27,7 @@ Layout produced:
                                                                      symbol's folder)
 """
 
+import json
 import os
 import re
 import shutil
@@ -685,6 +686,252 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
             f"{round_num} round(s), daily files kept: {names}",
             flush=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Daily typed-column export (additive) — a second, parallel copy of each
+# day's already-merged daily Parquet (produced by merge_daily above), with
+# raw_json parsed into typed columns instead of one opaque JSON string
+# column. Purely reads merge_daily's finished output; never reads, writes,
+# or deletes anything in the existing hourly/daily/weekly layout above.
+#
+# Layout produced:
+#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_quote_<SYMBOL>.parquet
+#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_depth_<SYMBOL>.parquet
+#
+# Call build_daily_typed(day) AFTER merge_daily(day) has run for that day.
+# Old typed date-folders are pruned automatically each call — retention
+# is X9_TYPED_DAILY_RETENTION_DAYS days (default 3).
+# ---------------------------------------------------------------------------
+
+_DEPTH_LEVELS = 5
+
+# Fields present on every quote/depth tick payload seen in production data.
+_QUOTE_COMMON_FIELDS = [
+    "symbol", "exchange", "mode", "ltp", "ltt", "volume",
+    "open", "high", "low", "close",
+]
+# Present only on the "trade" variant of quote payloads — NULL elsewhere.
+_QUOTE_TRADE_FIELDS = [
+    "last_trade_quantity", "average_price",
+    "total_buy_quantity", "total_sell_quantity",
+]
+# Present on the "full" variant of quote payloads, and on all depth
+# payloads — NULL on the "trade"/"daily_close" quote variants.
+_QUOTE_FULL_FIELDS = [
+    "last_quantity", "oi", "upper_circuit", "lower_circuit",
+]
+# Present only on the rare synthetic daily-close variant — NULL elsewhere.
+_QUOTE_DAILY_CLOSE_FIELDS = ["interval", "source"]
+
+
+def _typed_retention_days() -> int:
+    return int(os.getenv("X9_TYPED_DAILY_RETENTION_DAYS", "3"))
+
+
+def _typed_day_folder(day: date) -> str:
+    return day.strftime("%d-%m-%Y")
+
+
+def _typed_daily_dir(archive_root: Path, day: date) -> Path:
+    return archive_root / _typed_day_folder(day)
+
+
+def _typed_daily_path(archive_root: Path, day: date, prefix: str, symbol: str) -> Path:
+    return _typed_daily_dir(archive_root, day) / f"{_typed_day_folder(day)}_{prefix}_{symbol}.parquet"
+
+
+def _classify_quote_record(d: dict) -> str:
+    if "source" in d:
+        return "daily_close"
+    if "last_trade_quantity" in d:
+        return "trade"
+    return "full"
+
+
+def _flatten_quote_record(d: dict) -> dict:
+    """Parse one quote raw_json dict into a flat typed row. A field this
+    particular payload variant doesn't have becomes None (→ NULL column)
+    rather than raising, so one odd payload never aborts the whole export."""
+    out = {"record_type": _classify_quote_record(d)}
+    for f in (
+        _QUOTE_COMMON_FIELDS
+        + _QUOTE_TRADE_FIELDS
+        + _QUOTE_FULL_FIELDS
+        + _QUOTE_DAILY_CLOSE_FIELDS
+    ):
+        out[f] = d.get(f)
+    return out
+
+
+def _flatten_depth_record(d: dict) -> dict:
+    """Parse one depth raw_json dict into a flat typed row: top-level
+    quote-style fields plus fixed buy/sell price-ladder columns
+    (buy_price_1.._DEPTH_LEVELS, buy_qty_*, buy_orders_*, sell_* likewise).
+    A level beyond _DEPTH_LEVELS is dropped; a missing level is NULL —
+    either way this never raises."""
+    out = {}
+    for f in _QUOTE_COMMON_FIELDS + _QUOTE_FULL_FIELDS:
+        out[f] = d.get(f)
+    depth = d.get("depth") or {}
+    for side in ("buy", "sell"):
+        levels = depth.get(side) or []
+        for i in range(_DEPTH_LEVELS):
+            lvl = levels[i] if i < len(levels) else {}
+            out[f"{side}_price_{i + 1}"] = lvl.get("price")
+            out[f"{side}_qty_{i + 1}"] = lvl.get("quantity")
+            out[f"{side}_orders_{i + 1}"] = lvl.get("orders")
+    return out
+
+
+def _build_typed_one(daily_path: Path, out_path: Path, prefix: str) -> Tuple[str, object]:
+    """Read one already-merged daily Parquet file, parse raw_json into
+    typed columns, write the typed copy. Same (status, info) contract as
+    the existing _merge_*_one helpers: ('ok', row_count) / ('failed', reason)."""
+    try:
+        df = pd.read_parquet(daily_path)
+    except Exception as exc:
+        return "failed", f"read failed: {exc}"
+
+    flatten = _flatten_quote_record if prefix == "quote" else _flatten_depth_record
+    try:
+        records = [flatten(json.loads(s)) for s in df["raw_json"]]
+    except Exception as exc:
+        return "failed", f"parse failed: {exc}"
+
+    typed = pd.DataFrame.from_records(records)
+    typed.insert(0, "timestamp", df["timestamp"].values)
+    typed.insert(1, "ingest_ns", df["ingest_ns"].values)
+
+    try:
+        _write_parquet(typed, out_path)
+        written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
+    except Exception as exc:
+        return "failed", f"write/verify failed: {exc}"
+
+    if written_count != len(df):
+        return "failed", f"row count mismatch: source={len(df)} typed={written_count}"
+
+    return "ok", written_count
+
+
+def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
+    """
+    Additive export: for every symbol with an already-merged daily Parquet
+    file for `day` (produced by merge_daily — this function does NOT merge
+    or touch those files, only reads them), parse each row's raw_json into
+    typed columns and write a second copy into a date-first folder:
+
+        <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_<prefix>_<SYMBOL>.parquet
+
+    Safe to call more than once for the same day (just overwrites the
+    typed files). Call this AFTER merge_daily(day) has run for that day —
+    it silently skips any symbol/prefix with no daily file yet.
+
+    Also prunes typed date-folders older than X9_TYPED_DAILY_RETENTION_DAYS
+    (default 3) days — see prune_typed_daily().
+    """
+    archive_root = archive_root or _archive_root()
+    tag = "[ARCHIVER:TYPED]"
+    if not archive_root.exists():
+        return
+
+    built = 0
+    failed = 0
+    failure_reasons = []
+
+    for symbol_dir in sorted(archive_root.iterdir()):
+        if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
+            continue
+        symbol = symbol_dir.name
+        for prefix in ("depth", "quote"):
+            daily_path = _daily_path(archive_root, prefix, symbol, day)
+            if not daily_path.exists():
+                continue
+            out_path = _typed_daily_path(archive_root, day, prefix, symbol)
+            status, info = _build_typed_one(daily_path, out_path, prefix)
+            if status == "ok":
+                built += 1
+            else:
+                failed += 1
+                failure_reasons.append(f"{symbol}/{prefix} ({info})")
+
+    if built or failed:
+        summary = f"{tag} {_typed_day_folder(day)} — built {built} file(s)"
+        if failed:
+            summary += f", {failed} failed"
+        print(summary, flush=True)
+        if failure_reasons:
+            print(f"{tag}[WARN] failures: {', '.join(failure_reasons)}", flush=True)
+
+    prune_typed_daily(archive_root, reference_day=day)
+
+
+def _trading_day_cutoff(reference_day: date, retention_trading_days: int) -> date:
+    """
+    Walks backward from `reference_day`, counting trading days (weekends
+    and market holidays via is_trading_day() don't count), and returns the
+    date of the `retention_trading_days`-th most recent trading day
+    at-or-before `reference_day`. That returned date is the OLDEST day
+    that should still be kept — anything strictly before it is prunable.
+
+    e.g. retention_trading_days=3, reference_day=Wed → walks Wed(1),
+    Tue(2), Mon(3) → returns Mon. If reference_day itself falls on a
+    weekend/holiday it doesn't count, so the walk just continues further
+    back until it finds retention_trading_days actual trading days.
+    """
+    day = reference_day
+    counted = 0
+    while True:
+        if is_trading_day(day):
+            counted += 1
+            if counted >= retention_trading_days:
+                return day
+        day -= timedelta(days=1)
+
+
+def prune_typed_daily(
+    archive_root: Optional[Path] = None,
+    retention_days: Optional[int] = None,
+    reference_day: Optional[date] = None,
+) -> None:
+    """
+    Deletes typed date-folders (<archive_root>/<DD-MM-YYYY>/) that fall
+    before the `retention_days`-th most recent TRADING day at-or-before
+    `reference_day` (default: today IST; default retention:
+    X9_TYPED_DAILY_RETENTION_DAYS env var, else 3) — weekends and market
+    holidays are skipped when counting back, via is_trading_day(), so a
+    weekend never eats into the window. Only ever touches folders whose
+    name matches the DD-MM-YYYY typed-folder pattern — never a symbol
+    folder or a week folder (those use different name patterns and are
+    left alone).
+    """
+    archive_root = archive_root or _archive_root()
+    retention_days = retention_days if retention_days is not None else _typed_retention_days()
+    reference_day = reference_day or datetime.now(IST).date()
+    tag = "[ARCHIVER:TYPED]"
+
+    if not archive_root.exists():
+        return
+
+    cutoff = _trading_day_cutoff(reference_day, retention_days)
+
+    for entry in archive_root.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            folder_day = datetime.strptime(entry.name, "%d-%m-%Y").date()
+        except ValueError:
+            continue  # not a typed date-folder (symbol dir or week folder) — leave alone
+        if folder_day < cutoff:
+            try:
+                shutil.rmtree(entry)
+                print(
+                    f"{tag} pruned {entry.name} (before {retention_days}-trading-day cutoff {cutoff.isoformat()})",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"{tag}[ERROR] failed to prune {entry.name}: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
