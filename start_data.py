@@ -486,6 +486,7 @@ async def run_engine():
                 today = now_kolkata().date()
                 await asyncio.to_thread(parquet_archiver.run_once, True)
                 await asyncio.to_thread(parquet_archiver.merge_daily, today)
+                await asyncio.to_thread(parquet_archiver.build_daily_typed, today)
                 if parquet_archiver.is_last_trading_day_of_week(today):
                     await asyncio.to_thread(parquet_archiver.merge_weekly, today)
             except Exception as exc:
