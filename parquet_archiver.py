@@ -822,6 +822,10 @@ def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:TYPED]"
     if not archive_root.exists():
+        print(
+            f"{tag}[WARN] archive dir not found: {archive_root.resolve()} — nothing built",
+            flush=True,
+        )
         return
 
     built = 0
@@ -876,8 +880,18 @@ def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
 
         built += 1
 
+    if not built and not failed:
+        print(
+            f"{tag} no daily files found for {day.isoformat()} under "
+            f"{archive_root.resolve()} — nothing built (has merge_daily run for this day?)",
+            flush=True,
+        )
+
     if built or failed:
-        summary = f"{tag} {_typed_day_folder(day)} — built {built} combined file(s)"
+        summary = (
+            f"{tag} {_typed_day_folder(day)} — built {built} combined file(s) "
+            f"in {_typed_daily_dir(archive_root, day).resolve()}"
+        )
         if failed:
             summary += f", {failed} failed"
         print(summary, flush=True)
