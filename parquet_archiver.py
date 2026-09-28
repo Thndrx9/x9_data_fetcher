@@ -737,8 +737,8 @@ def _typed_daily_dir(archive_root: Path, day: date) -> Path:
     return archive_root / _typed_day_folder(day)
 
 
-def _typed_daily_path(archive_root: Path, day: date, prefix: str, symbol: str) -> Path:
-    return _typed_daily_dir(archive_root, day) / f"{_typed_day_folder(day)}_{prefix}_{symbol}.parquet"
+def _typed_combined_path(archive_root: Path, day: date, prefix: str) -> Path:
+    return _typed_daily_dir(archive_root, day) / f"{_typed_day_folder(day)}_{prefix}.parquet"
 
 
 def _classify_quote_record(d: dict) -> str:
@@ -784,35 +784,19 @@ def _flatten_depth_record(d: dict) -> dict:
     return out
 
 
-def _build_typed_one(daily_path: Path, out_path: Path, prefix: str) -> Tuple[str, object]:
-    """Read one already-merged daily Parquet file, parse raw_json into
-    typed columns, write the typed copy. Same (status, info) contract as
-    the existing _merge_*_one helpers: ('ok', row_count) / ('failed', reason)."""
-    try:
-        df = pd.read_parquet(daily_path)
-    except Exception as exc:
-        return "failed", f"read failed: {exc}"
-
+def _typed_frame_for_symbol(daily_path: Path, prefix: str) -> pd.DataFrame:
+    """Read one already-merged daily Parquet file and return its typed
+    (parsed-from-raw_json) equivalent as a DataFrame — no file written
+    here, this just builds the piece that gets concatenated across
+    symbols by build_daily_typed(). Raises on read/parse failure so the
+    caller can attribute the failure to the right symbol."""
+    df = pd.read_parquet(daily_path)
     flatten = _flatten_quote_record if prefix == "quote" else _flatten_depth_record
-    try:
-        records = [flatten(json.loads(s)) for s in df["raw_json"]]
-    except Exception as exc:
-        return "failed", f"parse failed: {exc}"
-
+    records = [flatten(json.loads(s)) for s in df["raw_json"]]
     typed = pd.DataFrame.from_records(records)
     typed.insert(0, "timestamp", df["timestamp"].values)
     typed.insert(1, "ingest_ns", df["ingest_ns"].values)
-
-    try:
-        _write_parquet(typed, out_path)
-        written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
-    except Exception as exc:
-        return "failed", f"write/verify failed: {exc}"
-
-    if written_count != len(df):
-        return "failed", f"row count mismatch: source={len(df)} typed={written_count}"
-
-    return "ok", written_count
+    return typed
 
 
 def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
@@ -820,16 +804,20 @@ def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
     Additive export: for every symbol with an already-merged daily Parquet
     file for `day` (produced by merge_daily — this function does NOT merge
     or touch those files, only reads them), parse each row's raw_json into
-    typed columns and write a second copy into a date-first folder:
+    typed columns and write ONE combined file per prefix, covering every
+    symbol for that day (a `symbol` column tells the rows apart):
 
-        <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_<prefix>_<SYMBOL>.parquet
+        <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_quote.parquet
+        <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_depth.parquet
 
-    Safe to call more than once for the same day (just overwrites the
+    Safe to call more than once for the same day (just overwrites the two
     typed files). Call this AFTER merge_daily(day) has run for that day —
-    it silently skips any symbol/prefix with no daily file yet.
+    it silently skips any symbol/prefix with no daily file yet, and one
+    symbol's bad data doesn't drop the rest: it's excluded from the
+    combined file and reported in the failure summary.
 
-    Also prunes typed date-folders older than X9_TYPED_DAILY_RETENTION_DAYS
-    (default 3) days — see prune_typed_daily().
+    Also prunes typed date-folders older than the X9_TYPED_DAILY_RETENTION_DAYS
+    (default 3) most recent trading days — see prune_typed_daily().
     """
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:TYPED]"
@@ -840,24 +828,56 @@ def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
     failed = 0
     failure_reasons = []
 
-    for symbol_dir in sorted(archive_root.iterdir()):
-        if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
-            continue
-        symbol = symbol_dir.name
-        for prefix in ("depth", "quote"):
+    for prefix in ("depth", "quote"):
+        frames = []
+        for symbol_dir in sorted(archive_root.iterdir()):
+            if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
+                continue
+            symbol = symbol_dir.name
             daily_path = _daily_path(archive_root, prefix, symbol, day)
             if not daily_path.exists():
                 continue
-            out_path = _typed_daily_path(archive_root, day, prefix, symbol)
-            status, info = _build_typed_one(daily_path, out_path, prefix)
-            if status == "ok":
-                built += 1
-            else:
+            try:
+                typed = _typed_frame_for_symbol(daily_path, prefix)
+                # raw_json already carries a parsed "symbol" column (from
+                # the payload itself) — trust the folder name instead,
+                # since that's what merge_daily filed it under, and just
+                # move it to the front for readability.
+                typed["symbol"] = symbol
+                cols = ["timestamp", "ingest_ns", "symbol"] + [
+                    c for c in typed.columns if c not in ("timestamp", "ingest_ns", "symbol")
+                ]
+                typed = typed[cols]
+                frames.append((symbol, typed, len(pd.read_parquet(daily_path, columns=["timestamp"]))))
+            except Exception as exc:
                 failed += 1
-                failure_reasons.append(f"{symbol}/{prefix} ({info})")
+                failure_reasons.append(f"{symbol}/{prefix} (read/parse failed: {exc})")
+
+        if not frames:
+            continue
+
+        combined = pd.concat([f[1] for f in frames], ignore_index=True)
+        expected_rows = sum(f[2] for f in frames)
+        out_path = _typed_combined_path(archive_root, day, prefix)
+        try:
+            _write_parquet(combined, out_path)
+            written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
+        except Exception as exc:
+            failed += 1
+            failure_reasons.append(f"combined {prefix} (write/verify failed: {exc})")
+            continue
+
+        if written_count != expected_rows:
+            failed += 1
+            failure_reasons.append(
+                f"combined {prefix} (row count mismatch: source={expected_rows} typed={written_count})"
+            )
+            continue
+
+        built += 1
 
     if built or failed:
-        summary = f"{tag} {_typed_day_folder(day)} — built {built} file(s)"
+        summary = f"{tag} {_typed_day_folder(day)} — built {built} combined file(s)"
         if failed:
             summary += f", {failed} failed"
         print(summary, flush=True)
