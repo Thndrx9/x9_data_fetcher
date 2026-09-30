@@ -41,6 +41,8 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from x9_data_fetcher.market_time import is_trading_day
 from x9_data_fetcher.console import colorize as _colorize
@@ -749,54 +751,123 @@ def _classify_quote_record(d: dict) -> str:
     return "full"
 
 
-def _flatten_quote_record(d: dict) -> dict:
-    """Parse one quote raw_json dict into a flat typed row. A field this
-    particular payload variant doesn't have becomes None (→ NULL column)
-    rather than raising, so one odd payload never aborts the whole export."""
-    out = {"record_type": _classify_quote_record(d)}
-    for f in (
-        _QUOTE_COMMON_FIELDS
-        + _QUOTE_TRADE_FIELDS
-        + _QUOTE_FULL_FIELDS
-        + _QUOTE_DAILY_CLOSE_FIELDS
-    ):
-        out[f] = d.get(f)
-    return out
+# Fixed, explicit schemas — every symbol's table is built to conform to
+# these exactly, so a ParquetWriter can stream one symbol's table at a
+# time straight to disk instead of holding every symbol in memory before
+# writing (that all-symbols-at-once approach is what OOM-killed the
+# service on a 398-symbol/prefix archive — see build_daily_typed below).
+_QUOTE_TYPED_SCHEMA = pa.schema(
+    [
+        ("timestamp", pa.int64()),
+        ("ingest_ns", pa.int64()),
+        ("symbol", pa.string()),
+        ("record_type", pa.string()),
+        ("exchange", pa.string()),
+        ("mode", pa.int64()),
+        ("ltp", pa.float64()),
+        ("ltt", pa.int64()),
+        ("volume", pa.int64()),
+        ("open", pa.float64()),
+        ("high", pa.float64()),
+        ("low", pa.float64()),
+        ("close", pa.float64()),
+        ("last_trade_quantity", pa.int64()),
+        ("average_price", pa.float64()),
+        ("total_buy_quantity", pa.float64()),
+        ("total_sell_quantity", pa.float64()),
+        ("last_quantity", pa.int64()),
+        ("oi", pa.int64()),
+        ("upper_circuit", pa.float64()),
+        ("lower_circuit", pa.float64()),
+        ("interval", pa.string()),
+        ("source", pa.string()),
+    ]
+)
+
+_DEPTH_TYPED_SCHEMA = pa.schema(
+    [
+        ("timestamp", pa.int64()),
+        ("ingest_ns", pa.int64()),
+        ("symbol", pa.string()),
+        ("exchange", pa.string()),
+        ("mode", pa.int64()),
+        ("ltp", pa.float64()),
+        ("ltt", pa.int64()),
+        ("volume", pa.int64()),
+        ("open", pa.float64()),
+        ("high", pa.float64()),
+        ("low", pa.float64()),
+        ("close", pa.float64()),
+        ("last_quantity", pa.int64()),
+        ("oi", pa.int64()),
+        ("upper_circuit", pa.float64()),
+        ("lower_circuit", pa.float64()),
+    ]
+    + [
+        (f"{side}_{field}_{i}", pa.int64() if field in ("qty", "orders") else pa.float64())
+        for side in ("buy", "sell")
+        for i in range(1, _DEPTH_LEVELS + 1)
+        for field in ("price", "qty", "orders")
+    ]
+)
 
 
-def _flatten_depth_record(d: dict) -> dict:
-    """Parse one depth raw_json dict into a flat typed row: top-level
-    quote-style fields plus fixed buy/sell price-ladder columns
-    (buy_price_1.._DEPTH_LEVELS, buy_qty_*, buy_orders_*, sell_* likewise).
-    A level beyond _DEPTH_LEVELS is dropped; a missing level is NULL —
-    either way this never raises."""
-    out = {}
-    for f in _QUOTE_COMMON_FIELDS + _QUOTE_FULL_FIELDS:
-        out[f] = d.get(f)
-    depth = d.get("depth") or {}
-    for side in ("buy", "sell"):
-        levels = depth.get(side) or []
-        for i in range(_DEPTH_LEVELS):
-            lvl = levels[i] if i < len(levels) else {}
-            out[f"{side}_price_{i + 1}"] = lvl.get("price")
-            out[f"{side}_qty_{i + 1}"] = lvl.get("quantity")
-            out[f"{side}_orders_{i + 1}"] = lvl.get("orders")
-    return out
+def _quote_columns(daily_path: Path, symbol: str) -> Dict[str, list]:
+    """Read one already-merged daily quote Parquet file and return its
+    parsed-from-raw_json data as a dict of plain Python lists, column-name
+    -> values, matching _QUOTE_TYPED_SCHEMA exactly. Plain lists (not a
+    pandas DataFrame) so a value the JSON payload doesn't have for that
+    row stays a real None straight through to pa.table(), instead of
+    pandas silently upcasting a missing int column to float NaN."""
+    df = pd.read_parquet(daily_path, columns=["timestamp", "ingest_ns", "raw_json"])
+    fields = (
+        _QUOTE_COMMON_FIELDS + _QUOTE_TRADE_FIELDS + _QUOTE_FULL_FIELDS + _QUOTE_DAILY_CLOSE_FIELDS
+    )
+    cols: Dict[str, list] = {f: [] for f in fields}
+    record_types: List[str] = []
+    for s in df["raw_json"]:
+        d = json.loads(s)
+        record_types.append(_classify_quote_record(d))
+        for f in fields:
+            cols[f].append(d.get(f))
+    cols["timestamp"] = df["timestamp"].tolist()
+    cols["ingest_ns"] = df["ingest_ns"].tolist()
+    cols["symbol"] = [symbol] * len(df)
+    cols["record_type"] = record_types
+    return cols
 
 
-def _typed_frame_for_symbol(daily_path: Path, prefix: str) -> pd.DataFrame:
-    """Read one already-merged daily Parquet file and return its typed
-    (parsed-from-raw_json) equivalent as a DataFrame — no file written
-    here, this just builds the piece that gets concatenated across
-    symbols by build_daily_typed(). Raises on read/parse failure so the
-    caller can attribute the failure to the right symbol."""
-    df = pd.read_parquet(daily_path)
-    flatten = _flatten_quote_record if prefix == "quote" else _flatten_depth_record
-    records = [flatten(json.loads(s)) for s in df["raw_json"]]
-    typed = pd.DataFrame.from_records(records)
-    typed.insert(0, "timestamp", df["timestamp"].values)
-    typed.insert(1, "ingest_ns", df["ingest_ns"].values)
-    return typed
+def _depth_columns(daily_path: Path, symbol: str) -> Dict[str, list]:
+    """Same idea as _quote_columns but for depth payloads: top-level
+    quote-style fields plus fixed buy/sell price-ladder columns, matching
+    _DEPTH_TYPED_SCHEMA exactly. A depth level beyond _DEPTH_LEVELS is
+    dropped; a missing level is None (→ NULL) — either way this never
+    raises on one odd payload."""
+    df = pd.read_parquet(daily_path, columns=["timestamp", "ingest_ns", "raw_json"])
+    top_fields = _QUOTE_COMMON_FIELDS + _QUOTE_FULL_FIELDS
+    level_cols = [
+        f"{side}_{field}_{i}"
+        for side in ("buy", "sell")
+        for i in range(1, _DEPTH_LEVELS + 1)
+        for field in ("price", "qty", "orders")
+    ]
+    cols: Dict[str, list] = {f: [] for f in top_fields + level_cols}
+    for s in df["raw_json"]:
+        d = json.loads(s)
+        for f in top_fields:
+            cols[f].append(d.get(f))
+        depth = d.get("depth") or {}
+        for side in ("buy", "sell"):
+            levels = depth.get(side) or []
+            for i in range(_DEPTH_LEVELS):
+                lvl = levels[i] if i < len(levels) else {}
+                cols[f"{side}_price_{i + 1}"].append(lvl.get("price"))
+                cols[f"{side}_qty_{i + 1}"].append(lvl.get("quantity"))
+                cols[f"{side}_orders_{i + 1}"].append(lvl.get("orders"))
+    cols["timestamp"] = df["timestamp"].tolist()
+    cols["ingest_ns"] = df["ingest_ns"].tolist()
+    cols["symbol"] = [symbol] * len(df)
+    return cols
 
 
 def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
@@ -809,6 +880,14 @@ def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
 
         <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_quote.parquet
         <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_depth.parquet
+
+    Streams one symbol's table at a time straight to disk via a
+    ParquetWriter against a fixed schema, rather than holding every
+    symbol's parsed data in memory before writing — with hundreds of
+    symbols, building the whole combined table in memory first is what
+    can trigger the OS's OOM killer partway through and lose the file
+    entirely with no error logged (the kill is a SIGKILL: the process
+    dies before reaching any of the code below that would log a failure).
 
     Safe to call more than once for the same day (just overwrites the two
     typed files). Call this AFTER merge_daily(day) has run for that day —
@@ -832,49 +911,60 @@ def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
     failed = 0
     failure_reasons = []
 
-    for prefix in ("depth", "quote"):
-        frames = []
-        for symbol_dir in sorted(archive_root.iterdir()):
-            if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
-                continue
-            symbol = symbol_dir.name
-            daily_path = _daily_path(archive_root, prefix, symbol, day)
-            if not daily_path.exists():
-                continue
-            try:
-                typed = _typed_frame_for_symbol(daily_path, prefix)
-                # raw_json already carries a parsed "symbol" column (from
-                # the payload itself) — trust the folder name instead,
-                # since that's what merge_daily filed it under, and just
-                # move it to the front for readability.
-                typed["symbol"] = symbol
-                cols = ["timestamp", "ingest_ns", "symbol"] + [
-                    c for c in typed.columns if c not in ("timestamp", "ingest_ns", "symbol")
-                ]
-                typed = typed[cols]
-                frames.append((symbol, typed, len(pd.read_parquet(daily_path, columns=["timestamp"]))))
-            except Exception as exc:
-                failed += 1
-                failure_reasons.append(f"{symbol}/{prefix} (read/parse failed: {exc})")
+    for prefix, schema, columns_fn in (
+        ("depth", _DEPTH_TYPED_SCHEMA, _depth_columns),
+        ("quote", _QUOTE_TYPED_SCHEMA, _quote_columns),
+    ):
+        out_path = _typed_combined_path(archive_root, day, prefix)
+        tmp_path = out_path.with_suffix(".parquet.tmp")
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not frames:
+        symbols_written = 0
+        expected_rows = 0
+        written_rows = 0
+        writer: Optional[pq.ParquetWriter] = None
+        try:
+            for symbol_dir in sorted(archive_root.iterdir()):
+                if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
+                    continue
+                symbol = symbol_dir.name
+                daily_path = _daily_path(archive_root, prefix, symbol, day)
+                if not daily_path.exists():
+                    continue
+                try:
+                    cols = columns_fn(daily_path, symbol)
+                    table = pa.table(cols, schema=schema)
+                except Exception as exc:
+                    failed += 1
+                    failure_reasons.append(f"{symbol}/{prefix} (read/parse failed: {exc})")
+                    continue
+
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp_path, schema, compression=COMPRESSION)
+                writer.write_table(table)
+                symbols_written += 1
+                expected_rows += table.num_rows
+                del cols, table  # release this symbol's data before the next one
+        finally:
+            if writer is not None:
+                writer.close()
+
+        if symbols_written == 0:
+            tmp_path.unlink(missing_ok=True)
             continue
 
-        combined = pd.concat([f[1] for f in frames], ignore_index=True)
-        expected_rows = sum(f[2] for f in frames)
-        out_path = _typed_combined_path(archive_root, day, prefix)
         try:
-            _write_parquet(combined, out_path)
-            written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
+            tmp_path.replace(out_path)  # atomic on same filesystem
+            written_rows = pq.ParquetFile(out_path).metadata.num_rows
         except Exception as exc:
             failed += 1
-            failure_reasons.append(f"combined {prefix} (write/verify failed: {exc})")
+            failure_reasons.append(f"combined {prefix} (finalize/verify failed: {exc})")
             continue
 
-        if written_count != expected_rows:
+        if written_rows != expected_rows:
             failed += 1
             failure_reasons.append(
-                f"combined {prefix} (row count mismatch: source={expected_rows} typed={written_count})"
+                f"combined {prefix} (row count mismatch: source={expected_rows} typed={written_rows})"
             )
             continue
 
