@@ -1106,6 +1106,20 @@ def _spillover_load(table: str, tag: str) -> Dict[str, List[dict]]:
             )
     except Exception as exc:
         _safe_print(f"{tag}[ERROR] failed to load spillover file {path}: {exc}")
+        # Unreadable/corrupt (e.g. a stub file left by a process killed
+        # between sqlite3.connect() and CREATE TABLE) — remove it so this
+        # same error doesn't repeat on every future startup. Any rows in
+        # it were already unrecoverable; leaving the file in place only
+        # guarantees a repeat of this error forever.
+        try:
+            if path.exists():
+                path.unlink()
+                _safe_print(f"{tag}[WARN] removed unreadable spillover file {path}")
+        except Exception as cleanup_exc:
+            _safe_print(
+                f"{tag}[ERROR] also failed to remove broken spillover file "
+                f"{path}: {cleanup_exc}"
+            )
     return recovered
 
 

@@ -22,11 +22,17 @@
         "2026-09-14",
         "2026-10-02",
         "2026-10-20",
-        "2026-11-08",
         "2026-11-10",
         "2026-11-24",
         "2026-12-25"
     ],
-    "special_open": [],
-    "_last_updated": "2026-09-07"
+    "special_open": [
+        {
+            "date": "2026-11-08",
+            "start": "14:20",
+            "end": "15:30",
+            "_comment": "Diwali Laxmi Pujan Muhurat trading"
+        }
+    ],
+    "_last_updated": "2026-11-14"
 }
