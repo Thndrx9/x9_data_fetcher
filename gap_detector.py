@@ -15,6 +15,7 @@ import psycopg2
 
 from x9_data_fetcher import connection_log
 from x9_data_fetcher.market_time import (
+    CAS_CONTINUOUS_END,
     MARKET_CLOSE,
     MARKET_OPEN,
     is_trading_day,
@@ -94,6 +95,27 @@ def _session_open(day: date) -> datetime:
 def _session_last_candle(day: date) -> datetime:
     close_dt = datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata)
     return close_dt - timedelta(minutes=1)
+
+
+def _cas_last_candle(day: date) -> datetime:
+    """Last 1-minute candle that exists for a CAS (F&O-eligible) stock."""
+    cutoff = datetime.combine(day, CAS_CONTINUOUS_END, tzinfo=tz_kolkata)
+    return cutoff - timedelta(minutes=1)
+
+
+def _clip_windows_for_cas(windows: List[HistoryWindow]) -> List[HistoryWindow]:
+    """
+    CAS stocks have no continuous trading from 15:15, so the broker never
+    has candles after 15:14. Trim each window's end to 15:14 and drop any
+    window that lies entirely at/after 15:15.
+    """
+    clipped: List[HistoryWindow] = []
+    for start, end in windows:
+        last = _cas_last_candle(start.date())
+        if start > last:
+            continue
+        clipped.append((start, min(end, last)))
+    return clipped
 
 
 def _previous_trading_day(day: date) -> Optional[date]:
@@ -313,9 +335,15 @@ def _find_symbol_gaps(
     now: datetime,
     quote_output_dir: Optional[str] = None,
     log_windows_cache: Optional[Dict[date, Optional[List[HistoryWindow]]]] = None,
+    is_cas: bool = False,
 ) -> List[HistoryWindow]:
     """
     Return every (start, end) window missing for this symbol.
+
+    is_cas: the symbol goes through NSE's Closing Auction Session, so its
+    candles end at 15:14 — every window is clipped to that (the shared
+    log-window cache itself stays unclipped, since it's reused by
+    non-CAS symbols).
 
     Primary source - the connection log (DAY_STARTED / DISCONNECTED /
     RECONNECTED / DAY_NOT_STARTED).  If the log has data for a day, its
@@ -386,16 +414,20 @@ def _find_symbol_gaps(
                     log_windows_cache[day] = [(session_start, session_end)]
                     log_windows = log_windows_cache[day]
             if log_windows:
-                gaps.extend(log_windows)
+                gaps.extend(_clip_windows_for_cas(log_windows) if is_cas else log_windows)
             # else: log confirms a clean day - nothing to do, no scan needed
             continue
 
         # -- no log data for this day - fall back to the data scan --------
+        if is_cas:
+            session_end = min(session_end, _cas_last_candle(day))
         day_start_ms = int(
             datetime.combine(day, MARKET_OPEN, tzinfo=tz_kolkata).timestamp() * 1000
         )
         day_end_ms = int(
-            datetime.combine(day, MARKET_CLOSE, tzinfo=tz_kolkata).timestamp() * 1000
+            datetime.combine(
+                day, CAS_CONTINUOUS_END if is_cas else MARKET_CLOSE, tzinfo=tz_kolkata
+            ).timestamp() * 1000
         )
         timestamps = (
             live_timestamps_for_range(live_conn, table, day_start_ms, day_end_ms)

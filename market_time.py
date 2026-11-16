@@ -27,6 +27,10 @@ except ImportError:
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 PRE_CONNECT = dtime(9, 14)  # 1 minute before market open
+# NSE Closing Auction Session (CAS): F&O-eligible stocks stop continuous
+# trading here (the auction runs to ~15:30), so no 1-minute candles exist
+# for them from this time on — last real candle is 15:14.
+CAS_CONTINUOUS_END = dtime(15, 15)
 
 # ── Trading calendar ────────────────────────────────────────────────────
 _CALENDAR_FILE = Path(__file__).resolve().parent / "trading_calendar.json"
