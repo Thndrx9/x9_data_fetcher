@@ -21,7 +21,9 @@ from x9_data_fetcher.gap_detector import (
     _previous_trading_day,  # noqa: F401 — re-exported for start_data.py
     _to_ms,
 )
+from x9_data_fetcher.fo_symbols import get_fo_underlyings
 from x9_data_fetcher.market_time import (
+    CAS_CONTINUOUS_END,
     MARKET_CLOSE,
     MARKET_OPEN,
     is_market_open,
@@ -403,6 +405,18 @@ class BackfillManager:
             flush=True,
         )
 
+        # CAS (F&O-eligible) symbols have no candles from 15:15 — their
+        # gap windows are clipped and broker rows after 15:14 ignored.
+        # Empty set = unknown (list unavailable): behave as before.
+        cas_symbols = get_fo_underlyings(self.api_key)
+        if not cas_symbols:
+            print(
+                "[BACKFILL][WARN] CAS/F&O symbol list unavailable — not "
+                "clipping gaps at 15:15; CAS symbols may show as failing",
+                flush=True,
+            )
+        self._cas_symbols = cas_symbols
+
         # ── per-symbol gap detection ──────────────────────────────────────
         all_gaps: Dict[str, Tuple[str, List[HistoryWindow]]] = {}
         history_conn = None
@@ -447,6 +461,7 @@ class BackfillManager:
                     now,
                     quote_output_dir=self.quote_output_dir,
                     log_windows_cache=log_windows_cache,
+                    is_cas=symbol in cas_symbols,
                 )
 
                 if gaps and history_conn is not None:
@@ -714,6 +729,7 @@ class BackfillManager:
         window_end: datetime,
     ) -> Tuple[List[dict], Optional[str]]:
         """Slice/normalize already-fetched raw rows down to one window."""
+        is_cas = symbol in getattr(self, "_cas_symbols", ())
         start_ms = int(window_start.astimezone(timezone.utc).timestamp() * 1000)
         end_ms   = int(window_end.astimezone(timezone.utc).timestamp() * 1000)
         # Tolerate APIs that stamp the candle close time instead of open time
@@ -727,6 +743,10 @@ class BackfillManager:
                 continue
             parsed_timestamps.append(ts_ms)
             if ts_ms < start_ms or ts_ms > end_ms_tolerant:
+                continue
+            # CAS stock: anything stamped 15:15+ is auction data, not a
+            # continuous-trading candle — keep it out of history.
+            if is_cas and _ms_to_ist(ts_ms).time() >= CAS_CONTINUOUS_END:
                 continue
             normalized = _normalize_candle(row, symbol, exchange, self.interval)
             if normalized:
