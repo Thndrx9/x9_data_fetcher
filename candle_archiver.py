@@ -62,7 +62,7 @@ from x9_data_fetcher.pg_writer import (
     LIVE_TICK_RETENTION_TRADING_DAYS,
     _last_n_trading_days,
 )
-from x9_data_fetcher.fo_symbols import get_fo_underlyings
+from x9_data_fetcher.fo_symbols import get_fo_underlyings, normalize_symbol
 
 # This module only ever touches the PRIMARY database — the one holding raw
 # live ticks (quote_<symbol>/depth_<symbol>). It never touches the separate
@@ -269,7 +269,8 @@ def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime, api_k
     # Fetched once per db pass (not per symbol) — get_fo_underlyings()
     # itself only hits OpenAlgo when its cache is stale (see
     # fo_symbols.py), so this is cheap even called this often.
-    fo_underlyings = get_fo_underlyings(api_key)
+    # normalized: table names have special characters stripped
+    fo_underlyings = {normalize_symbol(s) for s in get_fo_underlyings(api_key)}
 
     try:
         conn.autocommit = False
@@ -312,7 +313,7 @@ def _archive_db(dbname: str, keep_recent_trading_days: int, now: datetime, api_k
             symbol = _quote_symbol_from_table(table)
             if not symbol:
                 continue
-            is_fo = symbol.upper() in fo_underlyings
+            is_fo = normalize_symbol(symbol) in fo_underlyings
 
             candle_table = f"candle1m_{symbol}".lower()
             table_exists = candle_table in existing_candle_tables

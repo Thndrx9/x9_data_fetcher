@@ -193,6 +193,15 @@ def _write_cas_symbols_csv(underlyings: Set[str]) -> None:
     )
 
 
+def normalize_symbol(symbol: str) -> str:
+    """
+    Same cleaning the quote_<symbol> tables and archive folders apply to a
+    symbol name (M&M -> MM, BAJAJ-AUTO -> BAJAJAUTO). Apply to BOTH sides
+    when matching a name taken from a table/folder against the F&O list.
+    """
+    return "".join(c for c in symbol if c.isalnum() or c == "_").upper()
+
+
 def get_fo_underlyings(api_key: str, max_age_hours: float = FO_LIST_MAX_AGE_HOURS) -> Set[str]:
     """
     Returns the current set of F&O-eligible underlying symbols
