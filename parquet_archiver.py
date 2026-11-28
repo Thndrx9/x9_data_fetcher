@@ -27,6 +27,7 @@ Layout produced:
                                                                      symbol's folder)
 """
 
+import fcntl
 import json
 import os
 import re
@@ -34,7 +35,9 @@ import shutil
 import signal
 import sqlite3
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -44,7 +47,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from x9_data_fetcher.market_time import is_trading_day
+from x9_data_fetcher.fo_symbols import get_fo_underlyings, normalize_symbol
+from x9_data_fetcher.market_time import is_trading_day, market_hours_for
 from x9_data_fetcher.console import colorize as _colorize
 
 _builtin_print = print
@@ -81,6 +85,9 @@ COMPRESSION = "zstd"
 # times.
 MERGE_MAX_ROUNDS = 3
 
+# Pause between retry rounds (merges, typed build, candle conversion).
+RETRY_WAIT_SEC = float(os.getenv("X9_ARCHIVER_RETRY_WAIT_SEC", "30"))
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -112,6 +119,59 @@ def _poll_interval_sec() -> float:
 
 def _nice_level() -> int:
     return int(os.getenv("X9_ARCHIVER_NICE", "15"))
+
+
+# ---------------------------------------------------------------------------
+# Cross-process lock and retry wait
+# ---------------------------------------------------------------------------
+
+_stop = False  # set by the standalone process's signal handler
+
+_thread_lock = threading.RLock()
+_lock_depth = 0
+_lock_handle = None
+
+
+@contextmanager
+def _archive_lock():
+    """
+    Only one archive operation at a time, across the standalone archiver
+    process and start_data.py's end-of-day pass. Re-entrant within a thread.
+    """
+    global _lock_depth, _lock_handle
+    with _thread_lock:
+        if _lock_depth == 0:
+            root = _archive_root()
+            root.mkdir(parents=True, exist_ok=True)
+            handle = open(root / ".archiver.lock", "w")
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if _stop:
+                        handle.close()
+                        raise RuntimeError("stopping while waiting for archive lock")
+                    time.sleep(0.2)
+            _lock_handle = handle
+        _lock_depth += 1
+        try:
+            yield
+        finally:
+            _lock_depth -= 1
+            if _lock_depth == 0:
+                _lock_handle.close()  # closing releases the flock
+                _lock_handle = None
+
+
+def _wait_before_retry() -> bool:
+    """Sleep RETRY_WAIT_SEC. Returns False if asked to stop meanwhile."""
+    deadline = time.monotonic() + RETRY_WAIT_SEC
+    while time.monotonic() < deadline:
+        if _stop:
+            return False
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return not _stop
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +323,11 @@ def _archive_db_file(db_path: Path, archive_root: Path) -> bool:
 
 
 def run_once(force_all: bool = False) -> None:
+    with _archive_lock():
+        _run_once_locked(force_all)
+
+
+def _run_once_locked(force_all: bool) -> None:
     """
     One archiving pass: find every closed hourly .db file across the
     configured source dirs and archive it.
@@ -351,8 +416,13 @@ def _merge_daily_one(
     if not chunks:
         return "no_chunks", None
 
+    out_path = _daily_path(archive_root, prefix, symbol, day)
+    # A daily file from an earlier merge is merged in too, never overwritten
+    # by only the chunks that turned up afterwards.
+    sources = ([out_path] if out_path.exists() else []) + chunks
+
     try:
-        frames = [pd.read_parquet(c) for c in chunks]
+        frames = [pd.read_parquet(c) for c in sources]
         src_count = sum(len(f) for f in frames)
         concatenated = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     except Exception as exc:
@@ -366,7 +436,6 @@ def _merge_daily_one(
     merged = concatenated.drop_duplicates(keep="first").reset_index(drop=True)
     expected_dupes = len(concatenated) - len(merged)
 
-    out_path = _daily_path(archive_root, prefix, symbol, day)
     try:
         _write_parquet(merged, out_path)
         written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
@@ -435,6 +504,8 @@ def merge_daily(day: date, archive_root: Optional[Path] = None) -> None:
     round_num = 0
 
     while items and round_num < MERGE_MAX_ROUNDS:
+        if round_num and not _wait_before_retry():
+            break
         round_num += 1
         round_total = len(items)
         if round_num == 1:
@@ -556,14 +627,19 @@ def _merge_weekly_one(
     if not daily_paths:
         return "no_chunks", None
 
+    out_path = _iso_week_path(archive_root, prefix, symbol, any_day_in_week)
     try:
         frames = [pd.read_parquet(p) for p in daily_paths]
-        src_count = sum(len(f) for f in frames)
-        merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+        if out_path.exists():
+            # week already partly merged (late daily file) — keep what's there
+            frames.insert(0, pd.read_parquet(out_path))
+            merged = pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+        else:
+            merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+        src_count = len(merged)
     except Exception as exc:
         return "failed", f"read failed: {exc}"
 
-    out_path = _iso_week_path(archive_root, prefix, symbol, any_day_in_week)
     try:
         _write_parquet(merged, out_path)
         written_count = len(pd.read_parquet(out_path, columns=["timestamp"]))
@@ -617,6 +693,8 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
     round_num = 0
 
     while items and round_num < MERGE_MAX_ROUNDS:
+        if round_num and not _wait_before_retry():
+            break
         round_num += 1
         round_total = len(items)
         if round_num == 1:
@@ -698,8 +776,8 @@ def merge_weekly(any_day_in_week: date, archive_root: Optional[Path] = None) -> 
 # or deletes anything in the existing hourly/daily/weekly layout above.
 #
 # Layout produced:
-#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_quote_<SYMBOL>.parquet
-#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_depth_<SYMBOL>.parquet
+#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_quote.parquet
+#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_depth.parquet
 #
 # Call build_daily_typed(day) AFTER merge_daily(day) has run for that day.
 # Old typed date-folders are pruned automatically each call — retention
@@ -870,125 +948,478 @@ def _depth_columns(daily_path: Path, symbol: str) -> Dict[str, list]:
     return cols
 
 
-def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> None:
+def _typed_symbol_dirs(archive_root: Path) -> List[Path]:
+    return [
+        p for p in sorted(archive_root.iterdir())
+        if p.is_dir() and not _WEEK_FOLDER_RE.match(p.name)
+    ]
+
+
+def _unmerged_sources(archive_root: Path, day: date) -> List[str]:
+    """Data for `day` that hasn't reached a daily file yet: hourly SQLite
+    files still waiting to be archived, and unmerged hourly chunks."""
+    found = []
+    seen: set = set()
+    for base_dir in _source_dirs():
+        for db_path in sorted(base_dir.glob(f"market_{day.isoformat()}_*.db")):
+            if db_path.resolve() not in seen:
+                seen.add(db_path.resolve())
+                found.append(f"{db_path.name} (not archived)")
+    for symbol_dir in _typed_symbol_dirs(archive_root):
+        for p in sorted(symbol_dir.glob(f"{day.isoformat()}-*.parquet")):
+            if _HOURLY_CHUNK_RE.match(p.name):
+                found.append(f"{symbol_dir.name}/{p.name} (not merged)")
+    return found
+
+
+def _build_typed_prefix(
+    archive_root: Path, day: date, prefix: str, schema: pa.Schema, columns_fn
+) -> List[str]:
     """
-    Additive export: for every symbol with an already-merged daily Parquet
-    file for `day` (produced by merge_daily — this function does NOT merge
-    or touch those files, only reads them), parse each row's raw_json into
-    typed columns and write ONE combined file per prefix, covering every
-    symbol for that day (a `symbol` column tells the rows apart):
+    Build one combined typed file. Streams one symbol at a time to disk (all
+    symbols in memory at once is what can trigger the OOM killer). The file
+    is published only if EVERY symbol with a daily file made it in and the
+    row count verifies. Returns failure reasons; empty means success (or no
+    daily files for this prefix, in which case nothing is written).
+    """
+    out_path = _typed_combined_path(archive_root, day, prefix)
+    tmp_path = out_path.with_suffix(".parquet.tmp")
+    failures: List[str] = []
+    expected_rows = 0
+    writer: Optional[pq.ParquetWriter] = None
+    try:
+        for symbol_dir in _typed_symbol_dirs(archive_root):
+            symbol = symbol_dir.name
+            daily_path = _daily_path(archive_root, prefix, symbol, day)
+            if not daily_path.exists():
+                continue
+            try:
+                table = pa.table(columns_fn(daily_path, symbol), schema=schema)
+            except Exception as exc:
+                failures.append(f"{symbol}/{prefix} (read/parse failed: {exc})")
+                continue
+            if writer is None:
+                tmp_path.parent.mkdir(parents=True, exist_ok=True)
+                writer = pq.ParquetWriter(tmp_path, schema, compression=COMPRESSION)
+            writer.write_table(table)
+            expected_rows += table.num_rows
+            del table  # release this symbol's data before the next one
+        if writer is not None:
+            writer.close()
+            writer = None
+            if not failures:
+                written = pq.ParquetFile(tmp_path).metadata.num_rows
+                if written != expected_rows:
+                    failures.append(
+                        f"combined {prefix} (row count mismatch: "
+                        f"source={expected_rows} typed={written})"
+                    )
+                else:
+                    tmp_path.replace(out_path)  # atomic on same filesystem
+    except Exception as exc:
+        failures.append(f"combined {prefix} (write failed: {exc})")
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        tmp_path.unlink(missing_ok=True)
+    return failures
+
+
+def build_daily_typed(day: date, archive_root: Optional[Path] = None) -> bool:
+    """
+    Additive export: parse every symbol's merged daily Parquet for `day` into
+    typed columns and write ONE combined file per prefix:
 
         <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_quote.parquet
         <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_depth.parquet
 
-    Streams one symbol's table at a time straight to disk via a
-    ParquetWriter against a fixed schema, rather than holding every
-    symbol's parsed data in memory before writing — with hundreds of
-    symbols, building the whole combined table in memory first is what
-    can trigger the OS's OOM killer partway through and lose the file
-    entirely with no error logged (the kill is a SIGKILL: the process
-    dies before reaching any of the code below that would log a failure).
+    Reads the daily files only; call after merge_daily(day).
 
-    Safe to call more than once for the same day (just overwrites the two
-    typed files). Call this AFTER merge_daily(day) has run for that day —
-    it silently skips any symbol/prefix with no daily file yet, and one
-    symbol's bad data doesn't drop the rest: it's excluded from the
-    combined file and reported in the failure summary.
-
-    Also prunes typed date-folders older than the X9_TYPED_DAILY_RETENTION_DAYS
-    (default 3) most recent trading days — see prune_typed_daily().
+    Up to MERGE_MAX_ROUNDS rounds. Any existing typed tick files for `day`
+    are removed first, and a file is only published when complete, so a typed
+    file that exists is always a complete one. Returns True only if there was
+    data and all of it was built.
     """
     archive_root = archive_root or _archive_root()
     tag = "[ARCHIVER:TYPED]"
-    if not archive_root.exists():
+    with _archive_lock():
+        if not archive_root.exists():
+            print(f"{tag}[WARN] archive dir not found: {archive_root.resolve()}", flush=True)
+            return False
+
+        for prefix in ("depth", "quote"):
+            _typed_combined_path(archive_root, day, prefix).unlink(missing_ok=True)
+
+        pending = {
+            "depth": (_DEPTH_TYPED_SCHEMA, _depth_columns),
+            "quote": (_QUOTE_TYPED_SCHEMA, _quote_columns),
+        }
+        failures: List[str] = []
+        for round_num in range(1, MERGE_MAX_ROUNDS + 1):
+            if round_num > 1:
+                if not _wait_before_retry():
+                    break
+                merge_daily(day, archive_root)
+
+            failures = _unmerged_sources(archive_root, day)
+            if not failures:
+                for prefix, (schema, columns_fn) in list(pending.items()):
+                    errors = _build_typed_prefix(archive_root, day, prefix, schema, columns_fn)
+                    if errors:
+                        failures.extend(errors)
+                    else:
+                        del pending[prefix]
+            if not failures:
+                break
+            print(
+                f"{tag}[WARN] {_typed_day_folder(day)} round {round_num}/{MERGE_MAX_ROUNDS} "
+                f"failed: {', '.join(failures)}",
+                flush=True,
+            )
+
+        if failures:
+            print(
+                f"{tag}[ERROR] {_typed_day_folder(day)} typed tick files incomplete — "
+                f"will retry at next startup or market close",
+                flush=True,
+            )
+            return False
+
+        built = [
+            p for p in ("depth", "quote")
+            if _typed_combined_path(archive_root, day, p).exists()
+        ]
+        if not built:
+            print(f"{tag} no daily files found for {day.isoformat()} — nothing built", flush=True)
+            return False
         print(
-            f"{tag}[WARN] archive dir not found: {archive_root.resolve()} — nothing built",
+            f"{tag} {_typed_day_folder(day)} — built {len(built)} combined file(s) "
+            f"in {_typed_daily_dir(archive_root, day).resolve()}",
             flush=True,
         )
-        return
+        return True
 
-    built = 0
-    failed = 0
-    failure_reasons = []
 
-    for prefix, schema, columns_fn in (
-        ("depth", _DEPTH_TYPED_SCHEMA, _depth_columns),
-        ("quote", _QUOTE_TYPED_SCHEMA, _quote_columns),
-    ):
-        out_path = _typed_combined_path(archive_root, day, prefix)
-        tmp_path = out_path.with_suffix(".parquet.tmp")
-        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Candle conversion — older typed tick days become 1-minute candles
+# ---------------------------------------------------------------------------
+#
+#   <archive_root>/<DD-MM-YYYY>/<DD-MM-YYYY>_candle1m.parquet
+#
+# Same rules as candle_archiver._BUILD_1M_CANDLES_SQL (the Postgres
+# candle1m_<symbol> builder). Keep the two in step.
 
-        symbols_written = 0
-        expected_rows = 0
-        written_rows = 0
-        writer: Optional[pq.ParquetWriter] = None
-        try:
-            for symbol_dir in sorted(archive_root.iterdir()):
-                if not symbol_dir.is_dir() or _WEEK_FOLDER_RE.match(symbol_dir.name):
+_CANDLE_SCHEMA = pa.schema(
+    [
+        ("symbol", pa.string()),
+        ("ts_ms", pa.int64()),
+        ("open", pa.float64()),
+        ("high", pa.float64()),
+        ("low", pa.float64()),
+        ("close", pa.float64()),
+        ("volume", pa.int64()),
+    ]
+)
+
+_IST_OFFSET_MS = 19_800_000
+_DAY_MS = 86_400_000
+_SESSION_OPEN_MS = 33_300_000   # 09:15 IST since midnight
+_FO_CUTOFF_MS = 54_900_000      # 15:15 IST since midnight
+_VOLUME_GAP_MS = 90_000
+
+
+def _build_candles(df: pd.DataFrame, day: date, is_fo: bool) -> pd.DataFrame:
+    """1-minute candles for ONE symbol's typed quote ticks."""
+    day_start = int(datetime(day.year, day.month, day.day, tzinfo=IST).timestamp() * 1000)
+    # daily_close is the broker's synthetic EOD row, not a tick — it never
+    # reaches the Postgres quote table the SQL builder reads.
+    df = df[(df["record_type"] != "daily_close") & df["timestamp"].notna() & df["ltp"].notna()]
+    ts = df["timestamp"].astype("int64")
+    since_midnight = (ts + _IST_OFFSET_MS) % _DAY_MS
+    keep = (ts >= day_start) & (ts < day_start + _DAY_MS) & (since_midnight >= _SESSION_OPEN_MS)
+    if is_fo:
+        keep &= since_midnight < _FO_CUTOFF_MS
+    df = df[keep].sort_values(["timestamp", "ingest_ns"], kind="stable")
+    if df.empty:
+        return pd.DataFrame(columns=_CANDLE_SCHEMA.names[1:])
+
+    ts = df["timestamp"].astype("int64")
+    cum = df["volume"].fillna(0).astype("int64")
+    # first tick of the day keeps its whole cumulative volume
+    volume = cum.diff().fillna(cum).clip(lower=0)
+    volume = volume.mask(ts.diff() > _VOLUME_GAP_MS, 0)
+    since_open = (ts + _IST_OFFSET_MS) % _DAY_MS - _SESSION_OPEN_MS
+
+    ticks = pd.DataFrame(
+        {
+            "ts_ms": day_start + _SESSION_OPEN_MS + since_open // 60_000 * 60_000,
+            "ltp": df["ltp"],
+            "volume": volume.astype("int64"),
+        }
+    )
+    return (
+        ticks.groupby("ts_ms", sort=True)
+        .agg(
+            open=("ltp", "first"),
+            high=("ltp", "max"),
+            low=("ltp", "min"),
+            close=("ltp", "last"),
+            volume=("volume", "sum"),
+        )
+        .reset_index()
+    )
+
+
+def _iter_symbol_ticks(path: Path):
+    """Yield (symbol, ticks) one symbol at a time from a combined typed quote
+    file (written symbol by symbol, so each symbol's rows are contiguous)."""
+    columns = ["symbol", "record_type", "timestamp", "ingest_ns", "ltp", "volume"]
+    parquet = pq.ParquetFile(path)
+    symbol, parts = None, []
+    for i in range(parquet.num_row_groups):
+        group = parquet.read_row_group(i, columns=columns).to_pandas()
+        for name, rows in group.groupby("symbol", sort=False):
+            if name != symbol and parts:
+                yield symbol, pd.concat(parts, ignore_index=True)
+                parts = []
+            symbol = name
+            parts.append(rows)
+    if parts:
+        yield symbol, pd.concat(parts, ignore_index=True)
+
+
+def _convert_once(archive_root: Path, day: date, fo_symbols: set) -> int:
+    """Write and verify the candle file. Raises on any problem."""
+    source = _typed_combined_path(archive_root, day, "quote")
+    out_path = _typed_combined_path(archive_root, day, "candle1m")
+    tmp_path = out_path.with_suffix(".parquet.tmp")
+    rows = 0
+    volume = 0
+    try:
+        with pq.ParquetWriter(tmp_path, _CANDLE_SCHEMA, compression=COMPRESSION) as writer:
+            for symbol, ticks in _iter_symbol_ticks(source):
+                candles = _build_candles(ticks, day, normalize_symbol(symbol) in fo_symbols)
+                if candles.empty:
                     continue
-                symbol = symbol_dir.name
-                daily_path = _daily_path(archive_root, prefix, symbol, day)
-                if not daily_path.exists():
-                    continue
-                try:
-                    cols = columns_fn(daily_path, symbol)
-                    table = pa.table(cols, schema=schema)
-                except Exception as exc:
-                    failed += 1
-                    failure_reasons.append(f"{symbol}/{prefix} (read/parse failed: {exc})")
-                    continue
+                candles.insert(0, "symbol", symbol)
+                writer.write_table(
+                    pa.Table.from_pandas(candles, schema=_CANDLE_SCHEMA, preserve_index=False)
+                )
+                rows += len(candles)
+                volume += int(candles["volume"].sum())
+        if rows == 0:
+            raise ValueError("no candles produced from the tick file")
+        check = pq.read_table(tmp_path, columns=["volume"])
+        written_volume = int(check.column("volume").to_pandas().sum())
+        if check.num_rows != rows or written_volume != volume:
+            raise ValueError(
+                f"verification failed: rows {check.num_rows}/{rows}, "
+                f"volume {written_volume}/{volume}"
+            )
+        tmp_path.replace(out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return rows
 
-                if writer is None:
-                    writer = pq.ParquetWriter(tmp_path, schema, compression=COMPRESSION)
-                writer.write_table(table)
-                symbols_written += 1
-                expected_rows += table.num_rows
-                del cols, table  # release this symbol's data before the next one
-        finally:
-            if writer is not None:
-                writer.close()
 
-        if symbols_written == 0:
-            tmp_path.unlink(missing_ok=True)
-            continue
+def convert_day_to_candles(day: date, api_key: str, archive_root: Optional[Path] = None) -> bool:
+    """
+    Turn one day's typed quote ticks into 1-minute candles, then delete that
+    day's typed quote and depth files. Tick files are deleted only after the
+    candle file is written and verified. Up to MERGE_MAX_ROUNDS rounds.
+    Per-symbol daily and weekly files are never touched.
+    """
+    archive_root = archive_root or _archive_root()
+    tag = "[ARCHIVER:CANDLE]"
+    label = _typed_day_folder(day)
+    with _archive_lock():
+        quote_path = _typed_combined_path(archive_root, day, "quote")
+        if not quote_path.exists():
+            return False
+        for round_num in range(1, MERGE_MAX_ROUNDS + 1):
+            if round_num > 1 and not _wait_before_retry():
+                break
+            try:
+                fo_symbols = {normalize_symbol(s) for s in get_fo_underlyings(api_key)}
+                # Ticks get deleted afterwards, so never guess the 15:15 cutoff.
+                if not fo_symbols:
+                    raise ValueError("F&O symbol list unavailable")
+                rows = _convert_once(archive_root, day, fo_symbols)
+                # depth first: if interrupted, the quote file still marks the
+                # day as unfinished and the next pass completes it
+                _typed_combined_path(archive_root, day, "depth").unlink(missing_ok=True)
+                quote_path.unlink()
+                print(f"{tag} {label} — {rows} candle(s) written, tick files removed", flush=True)
+                return True
+            except Exception as exc:
+                print(
+                    f"{tag}[WARN] {label} round {round_num}/{MERGE_MAX_ROUNDS} failed: {exc}",
+                    flush=True,
+                )
+        print(
+            f"{tag}[ERROR] {label} not converted — tick files kept, "
+            f"will retry at next startup or market close",
+            flush=True,
+        )
+        return False
 
-        try:
-            tmp_path.replace(out_path)  # atomic on same filesystem
-            written_rows = pq.ParquetFile(out_path).metadata.num_rows
-        except Exception as exc:
-            failed += 1
-            failure_reasons.append(f"combined {prefix} (finalize/verify failed: {exc})")
-            continue
 
-        if written_rows != expected_rows:
-            failed += 1
-            failure_reasons.append(
-                f"combined {prefix} (row count mismatch: source={expected_rows} typed={written_rows})"
+# ---------------------------------------------------------------------------
+# Closed-day pipeline — end of day, and catch-up at startup
+# ---------------------------------------------------------------------------
+
+def latest_closed_day(now: Optional[datetime] = None) -> date:
+    """The most recent trading day whose session has already ended."""
+    now = now or datetime.now(IST)
+    day = now.date()
+    if not (is_trading_day(day) and now.time() >= market_hours_for(day)[1]):
+        day -= timedelta(days=1)
+        while not is_trading_day(day):
+            day -= timedelta(days=1)
+    return day
+
+
+def _is_converted(archive_root: Path, day: date) -> bool:
+    return (
+        _typed_combined_path(archive_root, day, "candle1m").exists()
+        and not _typed_combined_path(archive_root, day, "quote").exists()
+    )
+
+
+def _has_daily_files(archive_root: Path, day: date, prefix: str) -> bool:
+    return any(
+        _daily_path(archive_root, prefix, d.name, day).exists()
+        for d in _typed_symbol_dirs(archive_root)
+    )
+
+
+def _is_typed_complete(archive_root: Path, day: date) -> bool:
+    """True if nothing more needs to be read from `day`'s daily files."""
+    if _unmerged_sources(archive_root, day):
+        return False
+    if _is_converted(archive_root, day):
+        return True
+    return all(
+        _typed_combined_path(archive_root, day, prefix).exists()
+        or not _has_daily_files(archive_root, day, prefix)
+        for prefix in ("depth", "quote")
+    )
+
+
+def _days_with_chunks(archive_root: Path, latest: date) -> List[date]:
+    days = set()
+    for symbol_dir in _typed_symbol_dirs(archive_root):
+        for p in symbol_dir.glob("*.parquet"):
+            m = _HOURLY_CHUNK_RE.match(p.name)
+            if m:
+                days.add(date.fromisoformat(m.group(1)))
+    return sorted(d for d in days if d <= latest)
+
+
+def _merge_finished_weeks(archive_root: Path, latest: date, kept: List[date]) -> None:
+    """
+    Weekly-merge every finished week that still has daily files. A week is
+    postponed while any day still inside typed retention hasn't been built
+    from those daily files (the merge deletes them).
+    """
+    weeks: Dict[Tuple[int, int], date] = {}
+    for symbol_dir in _typed_symbol_dirs(archive_root):
+        for p in symbol_dir.glob("*.parquet"):
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})-(depth|quote)\.parquet$", p.name)
+            if m:
+                d = date.fromisoformat(m.group(1))
+                weeks[tuple(d.isocalendar())[:2]] = d
+
+    for any_day in sorted(weeks.values()):
+        week_days = _days_in_iso_week(any_day)
+        if week_days[0] > latest or any(d > latest and is_trading_day(d) for d in week_days):
+            continue  # week still in progress
+        blocked = [
+            d for d in week_days
+            if d in kept and not _is_typed_complete(archive_root, d)
+        ]
+        if blocked:
+            print(
+                f"[ARCHIVER:WEEKLY][WARN] merge postponed — typed files not built for "
+                f"{', '.join(d.isoformat() for d in blocked)}",
+                flush=True,
             )
             continue
+        merge_weekly(any_day, archive_root)
 
-        built += 1
 
-    if not built and not failed:
-        print(
-            f"{tag} no daily files found for {day.isoformat()} under "
-            f"{archive_root.resolve()} — nothing built (has merge_daily run for this day?)",
-            flush=True,
+def process_closed_days(
+    latest: date, api_key: str, rebuild_latest: bool = False,
+    archive_root: Optional[Path] = None,
+) -> None:
+    """
+    Bring the archive up to date through `latest` (a closed trading day):
+      1. merge any leftover hourly chunks into daily files
+      2. build missing typed tick files for days still inside retention
+      3. convert every day OLDER than `latest` to candles — only once
+         `latest`'s own tick files are complete, so there is always one full
+         day of ticks
+      4. prune typed folders past retention
+      5. weekly-merge finished weeks
+
+    rebuild_latest=True (end of day) always rebuilds `latest`'s tick files.
+    """
+    archive_root = archive_root or _archive_root()
+    with _archive_lock():
+        if not archive_root.exists():
+            return
+
+        merged_days = _days_with_chunks(archive_root, latest)
+        for day in merged_days:
+            merge_daily(day, archive_root)
+
+        retention = max(1, _typed_retention_days())
+        kept = [latest]
+        day = latest
+        while len(kept) < retention:
+            day -= timedelta(days=1)
+            if is_trading_day(day):
+                kept.insert(0, day)
+
+        for day in kept:
+            if _is_converted(archive_root, day):
+                continue
+            has_data = bool(_unmerged_sources(archive_root, day)) or any(
+                _has_daily_files(archive_root, day, p) for p in ("depth", "quote")
+            )
+            if not has_data:
+                continue
+            stale = day in merged_days or (rebuild_latest and day == latest)
+            if stale or not _is_typed_complete(archive_root, day):
+                build_daily_typed(day, archive_root)
+
+        latest_ready = (
+            _typed_combined_path(archive_root, latest, "quote").exists()
+            and _is_typed_complete(archive_root, latest)
         )
+        if latest_ready:
+            for day in kept[:-1]:
+                if _is_typed_complete(archive_root, day):
+                    convert_day_to_candles(day, api_key, archive_root)
+        else:
+            print(
+                f"[ARCHIVER:CANDLE] tick files for {_typed_day_folder(latest)} not complete "
+                f"— older days left as ticks",
+                flush=True,
+            )
 
-    if built or failed:
-        summary = (
-            f"{tag} {_typed_day_folder(day)} — built {built} combined file(s) "
-            f"in {_typed_daily_dir(archive_root, day).resolve()}"
-        )
-        if failed:
-            summary += f", {failed} failed"
-        print(summary, flush=True)
-        if failure_reasons:
-            print(f"{tag}[WARN] failures: {', '.join(failure_reasons)}", flush=True)
+        prune_typed_daily(archive_root, reference_day=latest)
+        _merge_finished_weeks(archive_root, latest, kept)
 
-    prune_typed_daily(archive_root, reference_day=day)
+
+def run_end_of_day(day: date, api_key: str) -> None:
+    """Call only after the live writers have shut down for the day."""
+    with _archive_lock():
+        run_once(force_all=True)
+        process_closed_days(day, api_key, rebuild_latest=True)
 
 
 def _trading_day_cutoff(reference_day: date, retention_trading_days: int) -> date:
@@ -1062,9 +1493,6 @@ def prune_typed_daily(
 # Standalone process entrypoint
 # ---------------------------------------------------------------------------
 
-_stop = False
-
-
 def _handle_signal(signum, frame) -> None:
     global _stop
     _stop = True
@@ -1085,6 +1513,14 @@ def main() -> None:
         f"archive_root={_archive_root()})",
         flush=True,
     )
+
+    # Catch up anything a missed or failed market close left behind. Runs in
+    # this separate, reniced process so it never competes with live ingestion.
+    try:
+        run_once()
+        process_closed_days(latest_closed_day(), os.getenv("API_KEY", ""))
+    except Exception as exc:
+        print(f"{_TAG}[ERROR] startup catch-up failed: {exc}", flush=True)
 
     while not _stop:
         try:

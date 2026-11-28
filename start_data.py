@@ -484,11 +484,9 @@ async def run_engine():
         if session_stop.is_set() and not manual_stop.is_set():
             try:
                 today = now_kolkata().date()
-                await asyncio.to_thread(parquet_archiver.run_once, True)
-                await asyncio.to_thread(parquet_archiver.merge_daily, today)
-                await asyncio.to_thread(parquet_archiver.build_daily_typed, today)
-                if parquet_archiver.is_last_trading_day_of_week(today):
-                    await asyncio.to_thread(parquet_archiver.merge_weekly, today)
+                # archive, merge, typed ticks, older days -> candles, prune,
+                # weekly merge — each step retried (see parquet_archiver)
+                await asyncio.to_thread(parquet_archiver.run_end_of_day, today, api_key)
             except Exception as exc:
                 print(f"[ARCHIVER][ERROR] end-of-day archive/merge failed: {exc}", flush=True)
 
